@@ -1,0 +1,983 @@
+     1→import Phaser from "phaser";
+     2→import {
+     3→  TUNING,
+     4→  PALETTE,
+     5→  isCoarsePointer,
+     6→  reducedMotion,
+     7→  type Mode,
+     8→} from "../tuning";
+     9→import { bridge, EV, type StartPayload } from "../bridge";
+    10→import { SFX } from "../sfx";
+    11→import {
+    12→  getBestStreak,
+    13→  maybeUpdateBestStreak,
+    14→  userTemplatesFlat,
+    15→} from "@/lib/storage";
+    16→import {
+    17→  recognizeStroke,
+    18→  setUserTemplates,
+    19→  MIN_POINTS,
+    20→  MIN_BOX,
+    21→  type Pt,
+    22→} from "../gesture";
+    23→
+    24→type Wisp = {
+    25→  container: Phaser.GameObjects.Container;
+    26→  sprite: Phaser.GameObjects.Image;
+    27→  questionText: Phaser.GameObjects.Text;
+    28→  ring: Phaser.GameObjects.Graphics; // ember urgency ring (lowest only)
+    29→  variant: "a" | "b" | "c";
+    30→  a: number; // first addend  (= previous stream digit)
+    31→  b: number; // second addend (= the new stream digit)
+    32→  answer: number; // (a + b) % 10
+    33→  baseX: number; // lane center for sine sway
+    34→  phase: number; // sway phase offset
+    35→  speedPerMs: number; // fall speed (px/ms)
+    36→  trailTimer: number; // accumulates to emit a trail speck every ~180ms
+    37→};
+    38→
+    39→type Stroke = {
+    40→  points: Pt[];
+    41→};
+    42→
+    43→const FONT = "Silkscreen, 'Courier New', monospace";
+    44→const EMBER_HEX = 0xff6b35;
+    45→
+    46→// Phaser's Graphics.fillStyle/lineStyle and Image.setTintFill expect NUMERIC
+    47→// colors; PALETTE (in tuning.ts) holds hex strings for Text styles. Use these
+    48→// numeric forms wherever a Phaser API wants a color number.
+    49→const C = {
+    50→  ink: 0x14110f,
+    51→  bone: 0xf2e9d8,
+    52→  ember: 0xff6b35,
+    53→  outline: 0x241c18,
+    54→} as const;
+    55→
+    56→const WISP_KEYS = ["wisp_a", "wisp_b", "wisp_c"] as const;
+    57→
+    58→/**
+    59→ * Game scene — owns the canvas gameplay.
+    60→ *
+    61→ * INPUT MATRIX (final):
+    62→ *   - POINTER DRAWING (glyph cast) is active on ALL platforms, always — mouse
+    63→ *     on desktop, touch on mobile. Universal input. Ink trail + ghost digit.
+    64→ *   - KEYBOARD is attached ONLY on non-coarse-pointer devices (desktop). On
+    65→ *     touch devices no keyboard listeners are attached and no keyboard hint
+    66→ *     text is rendered anywhere. Desktop: 0-9/numpad cast + Esc pause.
+    67→ *   - PACING FAMILY ("keys" | "gesture") is a separate setting (from React via
+    68→ *     the "start" payload). It affects ONLY fall/spawn speeds. The keyboard
+    69→ *     stays functional on desktop even when family = "gesture" (PC testing
+    70→ *     path). The run's `mode` saved to the leaderboard = the pacing family.
+    71→ *
+    72→ * QUESTION MODEL (unchanged): global digit stream; each wisp carries its own
+    73→ * fixed "a + b" question; answer = (a+b)%10; uniqueness re-roll; any matching
+    74→ * airborne wisp dies; screen-effect-only casts (no projectile).
+    75→ */
+    76→export default class Game extends Phaser.Scene {
+    77→  private family: Mode = "keys";
+    78→  private keyboardEnabled = false;
+    79→  private recogInfo = false; // show "best=8 0.71 | next=0 0.58" readout (settings toggle)
+    80→  private running = false;
+    81→  private paused = false;
+    82→
+    83→  // gameplay state
+    84→  private streamDigit = 1;
+    85→  private wallHP = TUNING.WALL_HP;
+    86→  private score = 0;
+    87→  private streak = 0;
+    88→  private runBestStreak = 0;
+    89→  private correctCount = 0;
+    90→  private wrongCount = 0;
+    91→  private runStartTime = 0;
+    92→
+    93→  // spawning
+    94→  private wisps: Wisp[] = [];
+    95→  private spawnInterval = 0;
+    96→  private spawnTimer = 0;
+    97→  private goSecondSpawnPending = false; // 2nd wisp at GO, staggered ~0.8s
+    98→
+    99→  // wisp trail particle pool + cap
+   100→  private trailSpecks: Phaser.GameObjects.Image[] = [];
+   101→
+   102→  // input lock
+   103→  private inputLockUntil = 0;
+   104→
+   105→  // glyph stroke state (pointer drawing — always active)
+   106→  private stroke: Stroke | null = null;
+   107→
+   108→  // objects
+   109→  private wiz!: Phaser.GameObjects.Image;
+   110→  private keepImg!: Phaser.GameObjects.Image;
+   111→  private moon!: Phaser.GameObjects.Image;
+   112→  private flashRect!: Phaser.GameObjects.Rectangle;
+   113→  private goText: Phaser.GameObjects.Text | null = null;
+   114→
+   115→  // bound handlers (for cleanup)
+   116→  private boundKeyDown!: (e: KeyboardEvent) => void;
+   117→  private boundPointerDown!: (p: Phaser.Input.Pointer) => void;
+   118→  private boundPointerMove!: (p: Phaser.Input.Pointer) => void;
+   119→  private boundPointerUp!: (p: Phaser.Input.Pointer) => void;
+   120→  private boundStart!: (p: StartPayload) => void;
+   121→  private boundResume!: () => void;
+   122→  private boundRestart!: () => void;
+   123→  private boundQuit!: () => void;
+   124→  private boundSetPaused!: (v: boolean) => void;
+   125→  private boundContext!: (e: Event) => void;
+   126→  private boundShutdown!: () => void;
+   127→
+   128→  constructor() {
+   129→    super("Game");
+   130→  }
+   131→
+   132→  create(): void {
+   133→    // Coarse-pointer detection: decides ONLY whether keyboard listeners attach.
+   134→    this.keyboardEnabled = !isCoarsePointer();
+   135→    this.cameras.main.setBackgroundColor(PALETTE.ink);
+   136→
+   137→    // Load user-taught strokes into the recognizer (merged with built-ins).
+   138→    setUserTemplates(userTemplatesFlat());
+   139→
+   140→    this.drawBackground();
+   141→    this.drawWall();
+   142→    this.drawKeep();
+   143→    this.drawWizard();
+   144→    this.drawMoon();
+   145→    this.drawFlashRect();
+   146→
+   147→    // ---- Input ----
+   148→    // Keyboard: ONLY on non-coarse-pointer (desktop) devices.
+   149→    if (this.keyboardEnabled) {
+   150→      const kb = this.input.keyboard;
+   151→      if (kb) {
+   152→        this.boundKeyDown = (e: KeyboardEvent) => this.onKeyDown(e);
+   153→        kb.on("keydown", this.boundKeyDown);
+   154→      }
+   155→    }
+   156→    // Pointer drawing (glyph cast): ALWAYS active on every platform.
+   157→    this.boundPointerDown = (p: Phaser.Input.Pointer) => this.onPointerDown(p);
+   158→    this.boundPointerMove = (p: Phaser.Input.Pointer) => this.onPointerMove(p);
+   159→    this.boundPointerUp = (p: Phaser.Input.Pointer) => this.onPointerUp(p);
+   160→    this.input.on("pointerdown", this.boundPointerDown);
+   161→    this.input.on("pointermove", this.boundPointerMove);
+   162→    this.input.on("pointerup", this.boundPointerUp);
+   163→
+   164→    // Pointer robustness: capture the canvas at pointerdown so leaving the
+   165→    // canvas mid-stroke never truncates it; prevent right-click context menu.
+   166→    const canvas = this.sys.game.canvas;
+   167→    if (canvas) {
+   168→      this.boundContext = (e: Event) => e.preventDefault();
+   169→      canvas.addEventListener("contextmenu", this.boundContext);
+   170→    }
+   171→
+   172→    // ---- Bridge (React -> Phaser) ----
+   173→    this.boundStart = (p) => this.handleStart(p);
+   174→    this.boundResume = () => this.handleResume();
+   175→    this.boundRestart = () => this.handleRestart();
+   176→    this.boundQuit = () => this.handleQuit();
+   177→    this.boundSetPaused = (v) => this.handleSetPaused(v);
+   178→    bridge.on<StartPayload>(EV.start, this.boundStart);
+   179→    bridge.on(EV.resume, this.boundResume);
+   180→    bridge.on(EV.restart, this.boundRestart);
+   181→    bridge.on(EV.quit, this.boundQuit);
+   182→    bridge.on<boolean>(EV.setPaused, this.boundSetPaused);
+   183→    bridge.on<boolean>(EV.recog, (v) => {
+   184→      this.recogInfo = !!v;
+   185→    });
+   186→
+   187→    this.boundShutdown = () => this.cleanup();
+   188→    this.events.once("shutdown", this.boundShutdown);
+   189→    this.events.once("destroy", this.boundShutdown);
+   190→
+   191→    this.running = false;
+   192→    this.emitHud();
+   193→  }
+   194→
+   195→  /* ----------------------------- drawing ----------------------------- */
+   196→
+   197→  private drawBackground(): void {
+   198→    for (let i = 0; i < TUNING.STAR_COUNT; i++) {
+   199→      const s = this.add.image(
+   200→        Phaser.Math.Between(4, TUNING.WIDTH - 4),
+   201→        Phaser.Math.Between(4, TUNING.WALL_TOP_Y - 8),
+   202→        "star",
+   203→      );
+   204→      s.setScale(Phaser.Math.FloatBetween(0.6, 1.6));
+   205→      s.setAlpha(Phaser.Math.FloatBetween(0.35, 0.9));
+   206→      s.setDepth(0);
+   207→      s.setTintFill(C.bone);
+   208→    }
+   209→  }
+   210→
+   211→  private drawWall(): void {
+   212→    // Tiled wall strip: shuffle the 3 variants per tile position.
+   213→    const tileW = TUNING.WALL_TILE_W;
+   214→    const y = TUNING.WALL_TOP_Y;
+   215→    let variant = Phaser.Math.Between(0, 2);
+   216→    for (let x = 0; x < TUNING.WIDTH; x += tileW) {
+   217→      const t = this.add.image(x, y, "wall", variant);
+   218→      t.setOrigin(0, 0);
+   219→      t.setDepth(1);
+   220→      variant = (variant + 1 + Phaser.Math.Between(0, 1)) % 3;
+   221→    }
+   222→  }
+   223→
+   224→  private drawKeep(): void {
+   225→    this.keepImg = this.add.image(
+   226→      TUNING.KEEP_X,
+   227→      TUNING.KEEP_BOTTOM_Y,
+   228→      "keep",
+   229→      0,
+   230→    );
+   231→    this.keepImg.setOrigin(0.5, 1);
+   232→    this.keepImg.setScale(TUNING.KEEP_SCALE);
+   233→    this.keepImg.setDepth(1);
+   234→  }
+   235→
+   236→  private drawWizard(): void {
+   237→    this.wiz = this.add.image(
+   238→      TUNING.WIZ_X,
+   239→      TUNING.WIZ_BOTTOM_Y,
+   240→      "wiz",
+   241→      0,
+   242→    );
+   243→    this.wiz.setOrigin(0.5, 1);
+   244→    this.wiz.setScale(TUNING.WIZ_SCALE);
+   245→    this.wiz.setDepth(2);
+   246→    // gentle idle bob between frames 0 and 1 (flavor only — no projectile)
+   247→    this.tweens.add({
+   248→      targets: this.wiz,
+   249→      duration: 900,
+   250→      yoyo: true,
+   251→      repeat: -1,
+   252→      ease: "Sine.inOut",
+   253→      onYoyo: () => {
+   254→        if (this.wiz && this.wiz.active) this.wiz.setFrame(1);
+   255→      },
+   256→      onRepeat: () => {
+   257→        if (this.wiz && this.wiz.active) this.wiz.setFrame(0);
+   258→      },
+   259→    });
+   260→  }
+   261→
+   262→  private drawMoon(): void {
+   263→    this.moon = this.add.image(TUNING.MOON_X, TUNING.MOON_Y, "moon");
+   264→    this.moon.setAlpha(TUNING.MOON_ALPHA);
+   265→    this.moon.setDepth(0);
+   266→  }
+   267→
+   268→  private drawFlashRect(): void {
+   269→    this.flashRect = this.add
+   270→      .rectangle(
+   271→        TUNING.WIDTH / 2,
+   272→        TUNING.HEIGHT / 2,
+   273→        TUNING.WIDTH,
+   274→        TUNING.HEIGHT,
+   275→        EMBER_HEX,
+   276→        0,
+   277→      )
+   278→      .setDepth(100)
+   279→      .setScrollFactor(0);
+   280→  }
+   281→
+   282→  /** Keep switches to its cracked frame when wallHP <= threshold. */
+   283→  private refreshKeepFrame(): void {
+   284→    if (!this.keepImg) return;
+   285→    const cracked = this.wallHP <= TUNING.KEEP_CRACK_HP_THRESHOLD;
+   286→    this.keepImg.setFrame(cracked ? 1 : 0);
+   287→  }
+   288→
+   289→  /* ----------------------------- update ------------------------------ */
+   290→
+   291→  update(time: number, deltaMs: number): void {
+   292→    if (!this.running || this.paused) return;
+   293→
+   294→    // spawn (cap 2 -> 3 -> 4 by correctCount)
+   295→    const cap = this.airborneCap();
+   296→    this.spawnTimer -= deltaMs;
+   297→    if (this.spawnTimer <= 0 && this.wisps.length < cap) {
+   298→      this.spawnWisp();
+   299→      this.spawnTimer += this.spawnInterval;
+   300→      if (this.spawnTimer < 0) this.spawnTimer = this.spawnInterval;
+   301→    }
+   302→    // GO double-spawn: a 2nd wisp ~0.8s after the 1st, then regular interval
+   303→    if (
+   304→      this.goSecondSpawnPending &&
+   305→      this.wisps.length < cap &&
+   306→      time >= this.runStartTime + TUNING.GO_DOUBLE_SPAWN_DELAY
+   307→    ) {
+   308→      this.goSecondSpawnPending = false;
+   309→      this.spawnWisp();
+   310→    }
+   311→
+   312→    // move wisps (fall + sine sway) + emit trail specks
+   313→    for (const w of this.wisps) {
+   314→      w.container.y += w.speedPerMs * deltaMs;
+   315→      w.container.x =
+   316→        w.baseX +
+   317→        Math.sin(time * TUNING.SWAY_FREQ_PER_MS + w.phase) *
+   318→          TUNING.SWAY_AMPLITUDE;
+   319→      // flutter frame cycle
+   320→      w.sprite.setFrame(Math.floor(time / 140) % 4);
+   321→      // trail speck
+   322→      w.trailTimer += deltaMs;
+   323→      if (w.trailTimer >= TUNING.WISP_TRAIL_INTERVAL_MS) {
+   324→        w.trailTimer = 0;
+   325→        this.spawnWispTrail(w);
+   326→      }
+   327→      if (w.container.y >= TUNING.WALL_CONTACT_Y) {
+   328→        this.wallHit(w);
+   329→      }
+   330→    }
+   331→
+   332→    // ember urgency ring on the lowest wisp (closest to the wall = max y)
+   333→    const lowest = this.getLowest();
+   334→    for (const w of this.wisps) w.ring.setVisible(w === lowest);
+   335→  }
+   336→
+   337→  private airborneCap(): number {
+   338→    if (this.correctCount < TUNING.EARLY_PHASE_1) return TUNING.AIRBORN_CAP_1;
+   339→    if (this.correctCount < TUNING.EARLY_PHASE_2) return TUNING.AIRBORN_CAP_2;
+   340→    return TUNING.AIRBORN_CAP_3;
+   341→  }
+   342→
+   343→  /* ----------------------------- wisps ------------------------------- */
+   344→
+   345→  private spawnWisp(): void {
+   346→    const b = this.pickStreamDigit();
+   347→    const a = this.streamDigit;
+   348→    this.streamDigit = b;
+   349→    const answer = (a + b) % 10;
+   350→
+   351→    const fallTime =
+   352→      this.family === "gesture"
+   353→        ? TUNING.FALL_TIME_GESTURE
+   354→        : TUNING.FALL_TIME_KEYS;
+   355→    const distance = TUNING.WALL_CONTACT_Y - TUNING.WISP_SPAWN_Y;
+   356→    const speedPerMs = distance / fallTime;
+   357→
+   358→    const baseX = Phaser.Math.Between(
+   359→      TUNING.WISP_SPAWN_X_MIN,
+   360→      TUNING.WISP_SPAWN_X_MAX,
+   361→    );
+   362→    const container = this.add.container(baseX, TUNING.WISP_SPAWN_Y);
+   363→    container.setDepth(3);
+   364→
+   365→    // pick a variant at random; all read identically (same head/eyes)
+   366→    const variant = WISP_KEYS[Phaser.Math.Between(0, 2)];
+   367→    const sprite = this.add.image(0, 0, variant, 0);
+   368→    sprite.setOrigin(0.5, 0.5);
+   369→    sprite.setScale(TUNING.WISP_SCALE);
+   370→    container.add(sprite);
+   371→
+   372→    const questionText = this.add
+   373→      .text(0, TUNING.QUESTION_OFFSET_Y, `${a} + ${b}`, {
+   374→        fontFamily: FONT,
+   375→        fontSize: TUNING.QUESTION_FONT_SIZE,
+   376→        color: PALETTE.bone,
+   377→        align: "center",
+   378→      })
+   379→      .setOrigin(0.5);
+   380→    // ALL airborne questions render at FULL opacity.
+   381→    questionText.setAlpha(1);
+   382→    container.add(questionText);
+   383→
+   384→    const ring = this.add.graphics();
+   385→    ring.lineStyle(2, C.ember, 1);
+   386→    ring.strokeCircle(0, 0, 18);
+   387→    ring.setVisible(false);
+   388→    container.add(ring);
+   389→
+   390→    const wisp: Wisp = {
+   391→      container,
+   392→      sprite,
+   393→      questionText,
+   394→      ring,
+   395→      variant: variant === "wisp_a" ? "a" : variant === "wisp_b" ? "b" : "c",
+   396→      a,
+   397→      b,
+   398→      answer,
+   399→      baseX,
+   400→      phase: Math.random() * Math.PI * 2,
+   401→      speedPerMs,
+   402→      trailTimer: 0,
+   403→    };
+   404→    this.wisps.push(wisp);
+   405→    this.emitHud();
+   406→  }
+   407→
+   408→  /**
+   409→   * Pick the next stream digit b in [DIGIT_MIN..DIGIT_MAX] such that
+   410→   * (streamDigit + b) % 10 differs from every airborne wisp's answer.
+   411→   * Max DIGIT_PICK_TRIES re-rolls; with <=4 airborne and 9 options it always
+   412→   * succeeds. Falls back to the last candidate if it ever fails.
+   413→   */
+   414→  private pickStreamDigit(): number {
+   415→    const airborne = new Set(this.wisps.map((w) => w.answer));
+   416→    let d = Phaser.Math.Between(TUNING.DIGIT_MIN, TUNING.DIGIT_MAX);
+   417→    for (let i = 0; i < TUNING.DIGIT_PICK_TRIES; i++) {
+   418→      if (!airborne.has((this.streamDigit + d) % 10)) return d;
+   419→      d = Phaser.Math.Between(TUNING.DIGIT_MIN, TUNING.DIGIT_MAX);
+   420→    }
+   421→    return d;
+   422→  }
+   423→
+   424→  private getLowest(): Wisp | null {
+   425→    if (this.wisps.length === 0) return null;
+   426→    let best = this.wisps[0];
+   427→    for (const w of this.wisps) {
+   428→      if (w.container.y > best.container.y) best = w;
+   429→    }
+   430→    return best;
+   431→  }
+   432→
+   433→  /* ----------------------------- input ------------------------------- */
+   434→
+   435→  private onKeyDown(e: KeyboardEvent): void {
+   436→    if (e.key === "Escape") {
+   437→      if (this.running && !this.paused) bridge.emit(EV.pauseRequested);
+   438→      return;
+   439→    }
+   440→    if (!this.running || this.paused) return;
+   441→    let digit = -1;
+   442→    if (e.key >= "0" && e.key <= "9") digit = parseInt(e.key, 10);
+   443→    else if (e.code && e.code.startsWith("Numpad") && e.code.length === 7) {
+   444→      const d = parseInt(e.code.slice(6), 10);
+   445→      if (!Number.isNaN(d)) digit = d;
+   446→    }
+   447→    if (digit >= 0 && digit <= 9) this.cast(digit);
+   448→  }
+   449→
+   450→  // ---- pointer drawing (glyph cast) — ALWAYS active on every platform ----
+   451→  private onPointerDown(pointer: Phaser.Input.Pointer): void {
+   452→    if (!this.running || this.paused) return;
+   453→    if (this.time.now < this.inputLockUntil) return;
+   454→    // Capture the canvas so leaving it mid-stroke never truncates the stroke.
+   455→    const canvas = this.sys.game.canvas;
+   456→    if (canvas && pointer.event && "setPointerCapture" in canvas) {
+   457→      try {
+   458→        (canvas as HTMLCanvasElement).setPointerCapture(
+   459→          (pointer.event as PointerEvent).pointerId,
+   460→        );
+   461→      } catch {
+   462→        /* ignore — some browsers/devices don't support it */
+   463→      }
+   464→    }
+   465→    this.stroke = { points: [{ x: pointer.x, y: pointer.y }] };
+   466→  }
+   467→
+   468→  private onPointerMove(pointer: Phaser.Input.Pointer): void {
+   469→    if (!this.stroke) return;
+   470→    // Clamp to canvas bounds (instead of aborting the stroke) so a stroke
+   471→    // that grazes an edge still completes.
+   472→    const px = Phaser.Math.Clamp(pointer.x, 0, TUNING.WIDTH);
+   473→    const py = Phaser.Math.Clamp(pointer.y, 0, TUNING.HEIGHT);
+   474→    const pts = this.stroke.points;
+   475→    const last = pts[pts.length - 1];
+   476→    // drop near-duplicate points to keep the recognizer clean
+   477→    if (Math.hypot(px - last.x, py - last.y) >= 2) {
+   478→      pts.push({ x: px, y: py });
+   479→      this.spawnTrail(px, py);
+   480→    }
+   481→  }
+   482→
+   483→  private onPointerUp(_pointer: Phaser.Input.Pointer): void {
+   484→    if (!this.stroke) return;
+   485→    const pts = this.stroke.points;
+   486→    this.stroke = null;
+   487→
+   488→    // Sub-threshold strokes = silent cancel (no penalty, no effect).
+   489→    if (pts.length < MIN_POINTS) {
+   490→      this.emitRecog(null);
+   491→      return;
+   492→    }
+   493→    const box = this.bbox(pts);
+   494→    if (box.w < MIN_BOX && box.h < MIN_BOX) {
+   495→      this.emitRecog(null);
+   496→      return;
+   497→    }
+   498→
+   499→    const result = recognizeStroke(pts);
+   500→    const cx = (box.minX + box.maxX) / 2;
+   501→    const cy = (box.minY + box.maxY) / 2;
+   502→
+   503→    if (result && result.kind === "recognized") {
+   504→      // Recognized digit: show the ghost (bone white) so children see what
+   505→      // was read, then cast (correct or wrong — cast() decides by matching).
+   506→      this.showGhost(result.digit, cx, cy, true);
+   507→      this.cast(result.digit);
+   508→      this.emitRecog({
+   509→        best: result.digit,
+   510→        bestScore: result.score,
+   511→        next: result.nextDigit,
+   512→        nextScore: result.nextScore,
+   513→      });
+   514→    } else {
+   515→      // "unclear" or "unrecognized" = miscast: gray puff + gray ghost (smaller),
+   516→      // soft lock, no streak reset, never reveal answers.
+   517→      const ghostDigit =
+   518→        result && result.kind === "unclear" ? -1 : -1; // -1 => show "?" gray
+   519→      this.showGhost(ghostDigit, cx, cy, false);
+   520→      this.miscast(cx, cy);
+   521→      if (result) {
+   522→        this.emitRecog({ best: -1, bestScore: result.score, next: -1, nextScore: 0 });
+   523→      } else {
+   524→        this.emitRecog(null);
+   525→      }
+   526→    }
+   527→  }
+   528→
+   529→  /** Emit the recognition readout to React (only listened when recogInfo is on). */
+   530→  private emitRecog(r: { best: number; bestScore: number; next: number; nextScore: number } | null): void {
+   531→    if (!this.recogInfo) return;
+   532→    bridge.emit(EV.recog, r);
+   533→  }
+   534→
+   535→  private bbox(pts: Pt[]): {
+   536→    w: number;
+   537→    h: number;
+   538→    minX: number;
+   539→    maxX: number;
+   540→    minY: number;
+   541→    maxY: number;
+   542→  } {
+   543→    let minX = Infinity,
+   544→      minY = Infinity,
+   545→      maxX = -Infinity,
+   546→      maxY = -Infinity;
+   547→    for (const p of pts) {
+   548→      if (p.x < minX) minX = p.x;
+   549→      if (p.x > maxX) maxX = p.x;
+   550→      if (p.y < minY) minY = p.y;
+   551→      if (p.y > maxY) maxY = p.y;
+   552→    }
+   553→    return { w: maxX - minX, h: maxY - minY, minX, maxX, minY, maxY };
+   554→  }
+   555→
+   556→  private spawnTrail(x: number, y: number): void {
+   557→    const t = this.add.image(x, y, "star").setTintFill(C.ember);
+   558→    t.setScale(Phaser.Math.FloatBetween(2, 3.2));
+   559→    t.setAlpha(0.9).setDepth(8);
+   560→    this.tweens.add({
+   561→      targets: t,
+   562→      alpha: 0,
+   563→      scale: 0.2,
+   564→      duration: TUNING.TRAIL_LIFE_MS,
+   565→      onComplete: () => t.destroy(),
+   566→    });
+   567→  }
+   568→
+   569→  /** Ambient wisp trail: a 2px bone speck every ~180ms, fading in ~400ms. */
+   570→  private spawnWispTrail(w: Wisp): void {
+   571→    // respect the global particle cap
+   572→    if (this.trailSpecks.length >= TUNING.WISP_TRAIL_CAP) {
+   573→      // prune the oldest finished speck
+   574→      const old = this.trailSpecks.shift();
+   575→      if (old && old.active) old.destroy();
+   576→    }
+   577→    const s = this.add.image(
+   578→      w.container.x + Phaser.Math.Between(-6, 6),
+   579→      w.container.y - 6,
+   580→      "star",
+   581→    );
+   582→    s.setTintFill(C.bone);
+   583→    s.setScale(1);
+   584→    s.setAlpha(0.7).setDepth(2);
+   585→    this.trailSpecks.push(s);
+   586→    this.tweens.add({
+   587→      targets: s,
+   588→      alpha: 0,
+   589→      y: s.y - 6,
+   590→      duration: TUNING.WISP_TRAIL_LIFE_MS,
+   591→      onComplete: () => {
+   592→        s.destroy();
+   593→        const i = this.trailSpecks.indexOf(s);
+   594→        if (i >= 0) this.trailSpecks.splice(i, 1);
+   595→      },
+   596→    });
+   597→  }
+   598→
+   599→  /* ----------------------------- casting ----------------------------- */
+   600→
+   601→  /**
+   602→   * A recognized digit kills the airborne wisp whose answer equals it
+   603→   * (uniqueness guarantees at most one; safety: if a collision ever occurs,
+   604→   * kill the lowest matching, only one). Recognized but no match = wrong cast.
+   605→   */
+   606→  private cast(digit: number): void {
+   607→    if (!this.running || this.paused) return;
+   608→    if (this.time.now < this.inputLockUntil) return;
+   609→
+   610→    let target: Wisp | null = null;
+   611→    for (const w of this.wisps) {
+   612→      if (w.answer === digit) {
+   613→        // safety: prefer the lowest matching (closest to wall) on collision
+   614→        if (!target || w.container.y > target.container.y) target = w;
+   615→      }
+   616→    }
+   617→    if (target) this.correctKill(target);
+   618→    else this.wrongCast();
+   619→  }
+   620→
+   621→  private correctKill(w: Wisp): void {
+   622→    SFX.play("cast");
+   623→    const x = w.container.x;
+   624→    const y = w.container.y;
+   625→
+   626→    // remove from logic + pop the wisp (scale-up + fade)
+   627→    const idx = this.wisps.indexOf(w);
+   628→    if (idx >= 0) this.wisps.splice(idx, 1);
+   629→    w.ring.setVisible(false);
+   630→    this.tweens.add({
+   631→      targets: w.sprite,
+   632→      scaleX: TUNING.WISP_SCALE * TUNING.POP_SCALE,
+   633→      scaleY: TUNING.WISP_SCALE * TUNING.POP_SCALE,
+   634→      alpha: 0,
+   635→      duration: TUNING.POP_DURATION,
+   636→      ease: "Quad.out",
+   637→      onComplete: () => w.container.destroy(),
+   638→    });
+   639→    this.tweens.add({
+   640→      targets: w.questionText,
+   641→      alpha: 0,
+   642→      duration: TUNING.POP_DURATION,
+   643→    });
+   644→
+   645→    SFX.play("kill");
+   646→    this.spawnRing(x, y);
+   647→    this.spawnFloatPlus(x, y);
+   648→    this.blinkScreen(TUNING.EMBER_BLINK_ALPHA, TUNING.EMBER_BLINK_MS);
+   649→    this.pulseWiz();
+   650→
+   651→    // scoring + ramp
+   652→    this.score += TUNING.SCORE_PER_CAST;
+   653→    this.streak += 1;
+   654→    this.runBestStreak = Math.max(this.runBestStreak, this.streak);
+   655→    this.correctCount += 1;
+   656→    if (this.correctCount % TUNING.RAMP_EVERY === 0) {
+   657→      const floor =
+   658→        this.family === "gesture"
+   659→          ? TUNING.SPAWN_FLOOR_GESTURE
+   660→          : TUNING.SPAWN_FLOOR_KEYS;
+   661→      this.spawnInterval = Math.max(
+   662→        floor,
+   663→        this.spawnInterval * TUNING.RAMP_FACTOR,
+   664→      );
+   665→    }
+   666→    this.emitHud();
+   667→  }
+   668→
+   669→  private wrongCast(): void {
+   670→    SFX.play("fizzle");
+   671→    const lock =
+   672→      this.family === "gesture"
+   673→        ? TUNING.WRONG_LOCK_GESTURE
+   674→        : TUNING.WRONG_LOCK_KEYS;
+   675→    this.inputLockUntil = this.time.now + lock;
+   676→    this.streak = 0;
+   677→    this.wrongCount += 1;
+   678→    this.blinkScreen(TUNING.RED_BLINK_ALPHA, TUNING.RED_BLINK_MS);
+   679→    const lowest = this.getLowest();
+   680→    const sx = lowest ? lowest.container.x : TUNING.WIDTH / 2;
+   681→    const sy = lowest ? lowest.container.y : TUNING.WALL_CONTACT_Y - 40;
+   682→    this.spawnSparkle(sx, sy, C.ember, 6, TUNING.FIZZLE_SPARKLE_LIFE_MS);
+   683→    this.emitHud();
+   684→  }
+   685→
+   686→  private miscast(x: number, y: number): void {
+   687→    SFX.play("fizzle");
+   688→    this.inputLockUntil = this.time.now + TUNING.MISCAST_LOCK;
+   689→    // tiny gray puff at the stroke — no screen blink, no streak reset
+   690→    this.spawnSparkle(x, y, C.outline, 4, TUNING.PUFF_LIFE_MS);
+   691→  }
+   692→
+   693→  private wallHit(w: Wisp): void {
+   694→    const idx = this.wisps.indexOf(w);
+   695→    if (idx < 0) return;
+   696→    this.wisps.splice(idx, 1);
+   697→    w.container.destroy(); // its question dies with it
+   698→
+   699→    this.wallHP -= 1;
+   700→    SFX.play("wallHit");
+   701→    this.blinkScreen(TUNING.WALL_BLINK_ALPHA, TUNING.EMBER_BLINK_MS);
+   702→    if (!reducedMotion()) {
+   703→      this.cameras.main.shake(TUNING.SHAKE_DURATION, TUNING.SHAKE_INTENSITY);
+   704→    }
+   705→    this.refreshKeepFrame();
+   706→    if (this.wallHP <= 0) {
+   707→      this.gameover();
+   708→      return;
+   709→    }
+   710→    this.emitHud();
+   711→  }
+   712→
+   713→  /* ----------------------------- effects ----------------------------- */
+   714→
+   715→  /** Full-screen blink. Reduced motion halves the alpha. */
+   716→  private blinkScreen(baseAlpha: number, ms: number): void {
+   717→    const a = reducedMotion() ? baseAlpha / 2 : baseAlpha;
+   718→    this.flashRect.setFillStyle(EMBER_HEX);
+   719→    this.flashRect.setAlpha(a);
+   720→    this.tweens.add({
+   721→      targets: this.flashRect,
+   722→      alpha: 0,
+   723→      duration: ms,
+   724→    });
+   725→  }
+   726→
+   727→  private spawnRing(x: number, y: number): void {
+   728→    const g = this.add.graphics();
+   729→    g.lineStyle(3, C.ember, 1);
+   730→    g.strokeCircle(0, 0, TUNING.RING_RADIUS);
+   731→    g.setPosition(x, y);
+   732→    g.setDepth(5);
+   733→    g.setScale(0.4);
+   734→    this.tweens.add({
+   735→      targets: g,
+   736→      scale: 1.4,
+   737→      alpha: 0,
+   738→      duration: TUNING.RING_LIFE_MS,
+   739→      ease: "Quad.out",
+   740→      onComplete: () => g.destroy(),
+   741→    });
+   742→  }
+   743→
+   744→  private spawnFloatPlus(x: number, y: number): void {
+   745→    const t = this.add
+   746→      .text(x, y, "+100", {
+   747→        fontFamily: FONT,
+   748→        fontSize: "22px",
+   749→        color: PALETTE.ember,
+   750→      })
+   751→      .setOrigin(0.5)
+   752→      .setDepth(6);
+   753→    this.tweens.add({
+   754→      targets: t,
+   755→      y: y - TUNING.FLOAT_RISE,
+   756→      alpha: 0,
+   757→      duration: TUNING.FLOAT_PLUS100_MS,
+   758→      ease: "Quad.out",
+   759→      onComplete: () => t.destroy(),
+   760→    });
+   761→  }
+   762→
+   763→  private spawnSparkle(
+   764→    x: number,
+   765→    y: number,
+   766→    color: number,
+   767→    count: number,
+   768→    lifeMs: number,
+   769→  ): void {
+   770→    for (let i = 0; i < count; i++) {
+   771→      const s = this.add.image(x, y, "star").setTintFill(color);
+   772→      s.setScale(Phaser.Math.FloatBetween(1.6, 2.8));
+   773→      s.setAlpha(0.9).setDepth(8);
+   774→      const ang = (Math.PI * 2 * i) / count + Math.random();
+   775→      const dist = Phaser.Math.Between(8, 22);
+   776→      this.tweens.add({
+   777→        targets: s,
+   778→        x: x + Math.cos(ang) * dist,
+   779→        y: y + Math.sin(ang) * dist,
+   780→        alpha: 0,
+   781→        scale: 0.2,
+   782→        duration: lifeMs,
+   783→        ease: "Quad.out",
+   784→        onComplete: () => s.destroy(),
+   785→      });
+   786→    }
+   787→  }
+   788→
+   789→  /**
+   790→   * Show the digit ghost (~350ms fade).
+   791→   *  - recognized=true: bone white, full size (children see what was read).
+   792→   *  - recognized=false (unclear/unrecognized): dim gray + smaller ("?"),
+   793→   *    so kids learn which strokes register without ever seeing the answer.
+   794→   *  - digit=-1: renders "?" (miscast ghost).
+   795→   */
+   796→  private showGhost(digit: number, x: number, y: number, recognized: boolean): void {
+   797→    const label = digit < 0 ? "?" : String(digit);
+   798→    const color = recognized ? PALETTE.bone : "#8a7f72";
+   799→    const fontSize = recognized ? TUNING.GHOST_DIGIT_FONT : "40px";
+   800→    const alpha = recognized ? 0.9 : 0.5;
+   801→    const t = this.add
+   802→      .text(x, y, label, {
+   803→        fontFamily: FONT,
+   804→        fontSize,
+   805→        color,
+   806→      })
+   807→      .setOrigin(0.5)
+   808→      .setDepth(60)
+   809→      .setAlpha(alpha);
+   810→    this.tweens.add({
+   811→      targets: t,
+   812→      alpha: 0,
+   813→      duration: TUNING.GHOST_DIGIT_MS,
+   814→      onComplete: () => t.destroy(),
+   815→    });
+   816→  }
+   817→
+   818→  /** Wizard cast flare (frame 2, ~120ms, flavor only — nothing travels). */
+   819→  private pulseWiz(): void {
+   820→    if (!this.wiz || !this.wiz.active) return;
+   821→    this.wiz.setFrame(2);
+   822→    this.time.delayedCall(TUNING.WIZ_PULSE_MS, () => {
+   823→      if (this.wiz && this.wiz.active) this.wiz.setFrame(0);
+   824→    });
+   825→  }
+   826→
+   827→  /* ----------------------------- gameover ---------------------------- */
+   828→
+   829→  private gameover(): void {
+   830→    this.running = false;
+   831→    SFX.play("gameover");
+   832→
+   833→    const elapsedMin = Math.max(
+   834→      0.0001,
+   835→      (this.time.now - this.runStartTime) / 60000,
+   836→    );
+   837→    const dpm = Math.round(this.correctCount / elapsedMin);
+   838→    const total = this.correctCount + this.wrongCount;
+   839→    const accuracy = total > 0 ? Math.round((this.correctCount / total) * 100) : 0;
+   840→    const bestStreak = maybeUpdateBestStreak(this.runBestStreak);
+   841→    void getBestStreak();
+   842→
+   843→    // mode saved to the leaderboard = the pacing FAMILY active for the run.
+   844→    bridge.emit(EV.gameover, {
+   845→      score: this.score,
+   846→      dpm,
+   847→      accuracy,
+   848→      bestStreak,
+   849→      mode: this.family,
+   850→    });
+   851→    this.emitHud();
+   852→  }
+   853→
+   854→  /* ----------------------------- bridge ------------------------------- */
+   855→
+   856→  private handleStart(p: StartPayload): void {
+   857→    this.family = p?.family === "gesture" ? "gesture" : "keys";
+   858→    this.resetRun();
+   859→    this.showGo();
+   860→  }
+   861→
+   862→  private resetRun(): void {
+   863→    for (const w of this.wisps) w.container.destroy();
+   864→    this.wisps = [];
+   865→    for (const s of this.trailSpecks) s.destroy();
+   866→    this.trailSpecks = [];
+   867→
+   868→    this.wallHP = TUNING.WALL_HP;
+   869→    this.score = 0;
+   870→    this.streak = 0;
+   871→    this.runBestStreak = 0;
+   872→    this.correctCount = 0;
+   873→    this.wrongCount = 0;
+   874→    this.inputLockUntil = 0;
+   875→    this.stroke = null;
+   876→    this.goSecondSpawnPending = false;
+   877→    this.streamDigit = Phaser.Math.Between(TUNING.DIGIT_MIN, TUNING.DIGIT_MAX);
+   878→    this.spawnInterval =
+   879→      this.family === "gesture"
+   880→        ? TUNING.SPAWN_INTERVAL_GESTURE
+   881→        : TUNING.SPAWN_INTERVAL_KEYS;
+   882→    this.spawnTimer = TUNING.FIRST_SPAWN_DELAY;
+   883→    this.refreshKeepFrame();
+   884→    this.emitHud();
+   885→  }
+   886→
+   887→  private showGo(): void {
+   888→    this.goText?.destroy();
+   889→    this.goText = this.add
+   890→      .text(TUNING.WIDTH / 2, 360, "GO!", {
+   891→        fontFamily: FONT,
+   892→        fontSize: "64px",
+   893→        color: PALETTE.ember,
+   894→      })
+   895→      .setOrigin(0.5)
+   896→      .setDepth(50)
+   897→      .setAlpha(0);
+   898→
+   899→    this.tweens.add({
+   900→      targets: this.goText,
+   901→      alpha: 1,
+   902→      duration: 120,
+   903→      yoyo: true,
+   904→      hold: TUNING.GO_FLASH_MS - 240,
+   905→      onComplete: () => {
+   906→        this.goText?.destroy();
+   907→        this.goText = null;
+   908→        this.runStartTime = this.time.now;
+   909→        this.running = true;
+   910→        // spawn the 1st wisp immediately so the screen is alive at GO;
+   911→        // the 2nd arrives ~0.8s later (goSecondSpawnPending).
+   912→        this.spawnWisp();
+   913→        this.goSecondSpawnPending = true;
+   914→      },
+   915→    });
+   916→  }
+   917→
+   918→  private handleResume(): void {
+   919→    this.paused = false;
+   920→    this.tweens.timeScale = 1;
+   921→  }
+   922→
+   923→  private handleRestart(): void {
+   924→    this.running = false;
+   925→    this.paused = false;
+   926→    this.tweens.timeScale = 1;
+   927→    for (const w of this.wisps) w.container.destroy();
+   928→    this.wisps = [];
+   929→    for (const s of this.trailSpecks) s.destroy();
+   930→    this.trailSpecks = [];
+   931→    this.emitHud();
+   932→  }
+   933→
+   934→  private handleQuit(): void {
+   935→    this.running = false;
+   936→    this.paused = false;
+   937→    this.tweens.timeScale = 1;
+   938→    for (const w of this.wisps) w.container.destroy();
+   939→    this.wisps = [];
+   940→    for (const s of this.trailSpecks) s.destroy();
+   941→    this.trailSpecks = [];
+   942→    this.emitHud();
+   943→  }
+   944→
+   945→  private handleSetPaused(paused: boolean): void {
+   946→    this.paused = paused;
+   947→    // Freeze all tweens via timeScale=0 so the scene loop keeps running cleanly
+   948→    // (no Phaser "cannot pause non-running scene" warnings on duplicate Esc).
+   949→    this.tweens.timeScale = paused ? 0 : 1;
+   950→  }
+   951→
+   952→  private emitHud(): void {
+   953→    bridge.emit(EV.hud, {
+   954→      score: this.score,
+   955→      streak: this.streak,
+   956→      wallHP: this.wallHP,
+   957→    });
+   958→  }
+   959→
+   960→  /* ----------------------------- cleanup ----------------------------- */
+   961→
+   962→  private cleanup(): void {
+   963→    bridge.off(EV.start, this.boundStart);
+   964→    bridge.off(EV.resume, this.boundResume);
+   965→    bridge.off(EV.restart, this.boundRestart);
+   966→    bridge.off(EV.quit, this.boundQuit);
+   967→    bridge.off(EV.setPaused, this.boundSetPaused);
+   968→    if (this.keyboardEnabled) {
+   969→      const kb = this.input?.keyboard;
+   970→      if (kb && this.boundKeyDown) kb.off("keydown", this.boundKeyDown);
+   971→    }
+   972→    this.input?.off("pointerdown", this.boundPointerDown);
+   973→    this.input?.off("pointermove", this.boundPointerMove);
+   974→    this.input?.off("pointerup", this.boundPointerUp);
+   975→    const canvas = this.sys?.game?.canvas;
+   976→    if (canvas && this.boundContext) {
+   977→      canvas.removeEventListener("contextmenu", this.boundContext);
+   978→    }
+   979→    this.stroke = null;
+   980→    this.running = false;
+   981→  }
+   982→}
+   983→
