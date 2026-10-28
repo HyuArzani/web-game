@@ -19,14 +19,15 @@ type Wisp = {
   container: Phaser.GameObjects.Container;
   sprite: Phaser.GameObjects.Image;
   questionText: Phaser.GameObjects.Text;
-  ring: Phaser.GameObjects.Graphics;
-  variant: "a" | "b" | "c";
+  variant: "a" | "b" | "c" | "d";
   question: string;
   answer: number;
   baseX: number;
   phase: number;
   speedPerMs: number;
   trailTimer: number;
+  animState: "enter" | "idle" | "attack" | "death";
+  animDone: boolean; // true when death/attack animation completes
 };
 
 const FONT = "Silkscreen, 'Courier New', monospace";
@@ -48,7 +49,25 @@ const C = {
   stoneLight: 0x3d342b,
 } as const;
 
-const WISP_KEYS = ["wisp_a", "wisp_b", "wisp_c"] as const;
+// Enemy texture keys: PNG-loaded (enemy_a..d) with procedural fallback (wisp_a..c).
+// The PNG textures are loaded in Boot.ts preload. If a PNG fails to load, the
+// procedural wisp texture (baked from pixelmaps) is used instead.
+const ENEMY_KEYS = ["enemy_a", "enemy_b", "enemy_c", "enemy_d"];
+const FALLBACK_KEYS = ["wisp_a", "wisp_b", "wisp_c", "wisp_a"];
+
+// Animation frame ranges per enemy type [enterStart, enterEnd, idleStart, idleEnd, attackStart, attackEnd, deathStart, deathEnd]
+// Frame layout in each spritesheet: enter, idle, attack, death (contiguous).
+// These match the recreated clean pixel-art sheets (see scripts/sprites/gen_sprites.py):
+//   enemy_a (goblin_jetpack): 16 frames = 4 enter + 4 idle + 3 attack + 5 death  (384x24)
+//   enemy_b (slime_flyer):    13 frames = 3 enter + 3 idle + 3 attack + 4 death  (312x24)
+//   enemy_c (skeleton_wraith): 13 frames = 3 enter + 3 idle + 3 attack + 4 death (312x24)
+//   enemy_d (shadow_bat):     14 frames = 3 enter + 4 idle + 3 attack + 4 death  (336x24)
+const ENEMY_FRAME_RANGES: Record<string, [number, number, number, number, number, number, number, number]> = {
+  enemy_a: [0, 3, 4, 7, 8, 10, 11, 15],    // goblin: 16 frames (4 enter, 4 idle, 3 attack, 5 death)
+  enemy_b: [0, 2, 3, 5, 6, 8, 9, 12],     // slime: 13 frames (3 enter, 3 idle, 3 attack, 4 death)
+  enemy_c: [0, 2, 3, 5, 6, 8, 9, 12],     // wraith: 13 frames (3 enter, 3 idle, 3 attack, 4 death)
+  enemy_d: [0, 2, 3, 6, 7, 9, 10, 13],    // bat: 14 frames (3 enter, 4 idle, 3 attack, 4 death)
+};
 
 /**
  * Game scene — owns the canvas gameplay.
@@ -106,9 +125,25 @@ export default class Game extends Phaser.Scene {
   // objects
   private wiz!: Phaser.GameObjects.Image;
   private keepImg!: Phaser.GameObjects.Image;
-  private moon!: Phaser.GameObjects.Image;
+  private moon: Phaser.GameObjects.Image | null = null; // disabled in daytime redesign
   private flashRect!: Phaser.GameObjects.Rectangle;
   private goText: Phaser.GameObjects.Text | null = null;
+  private activeSpellOverlay: Phaser.GameObjects.Image | null = null;
+
+  // Daytime clouds (UI-redesign task) — drift horizontally + wrap.
+  private clouds: { img: Phaser.GameObjects.Image; speed: number }[] = [];
+
+  // Portal-castle tower (UI-redesign task) — Graphics-based glowing portal
+  // drawn ON TOP of the castle PNG but BELOW the wall + wizard.
+  private portalGfx: Phaser.GameObjects.Graphics | null = null;
+
+  // Wizard animation priority state machine:
+  //   "idle" < "casting" < "wrongAnswer" < "castleHit" < "gameover"
+  // Higher-priority reactions cancel lower ones. Only gameover is terminal
+  // (wizard does not return to idle afterward). All others resume idle.
+  private wizAnimState: "idle" | "casting" | "wrongAnswer" | "castleHit" | "gameover" = "idle";
+  private wizIdleTween: Phaser.Tweens.Tween | null = null;
+  private wizReactionTween: Phaser.Tweens.Tween | null = null;
 
   // bound handlers (for cleanup)
   private boundKeyDown!: (e: KeyboardEvent) => void;
@@ -131,9 +166,13 @@ export default class Game extends Phaser.Scene {
     this.drawBackground();
     this.drawWall();
     this.drawKeep();
+    this.drawPortal(); // portal layer on top of castle, below wall/wizard
     this.drawWizard();
-    this.drawMoon();
+    // Moon is DISABLED in the daytime redesign (Task ID 12).
     this.drawFlashRect();
+
+    // Register enemy animations (enter/idle/attack/death per enemy type)
+    this.registerEnemyAnimations();
 
     // ---- Input ----
     // Keyboard: ONLY on non-coarse-pointer (desktop) devices.
@@ -170,67 +209,224 @@ export default class Game extends Phaser.Scene {
   /* ----------------------------- drawing ----------------------------- */
 
   private drawBackground(): void {
-    for (let i = 0; i < TUNING.STAR_COUNT; i++) {
-      const s = this.add.image(
-        Phaser.Math.Between(4, TUNING.WIDTH - 4),
-        Phaser.Math.Between(4, TUNING.WALL_TOP_Y - 8),
-        "star",
+    // Use the PNG landscape background if loaded, otherwise fall back to stars.
+    if (this.textures.exists("bg_landscape")) {
+      const bg = this.add.image(0, 0, "bg_landscape");
+      bg.setOrigin(0, 0);
+      bg.setDepth(0);
+      bg.setDisplaySize(TUNING.WIDTH, TUNING.HEIGHT);
+    } else {
+      // Fallback: procedural stars on ink background
+      for (let i = 0; i < TUNING.STAR_COUNT; i++) {
+        const s = this.add.image(
+          Phaser.Math.Between(4, TUNING.WIDTH - 4),
+          Phaser.Math.Between(4, TUNING.WALL_TOP_Y - 8),
+          "star",
+        );
+        s.setScale(Phaser.Math.FloatBetween(0.6, 1.6));
+        s.setAlpha(Phaser.Math.FloatBetween(0.35, 0.9));
+        s.setDepth(0);
+        s.setTintFill(C.bone);
+      }
+    }
+    // Moon DISABLED in daytime redesign — see worklog Task ID 12.
+    // (this.moon intentionally left null; drawMoon() is never called.)
+    // Clouds drift above the landscape background (depth 0, above bg, below wall).
+    this.drawClouds();
+  }
+
+  /**
+   * Procedural drifting clouds. Each cloud is a small Graphics blob baked once
+   * into a texture, then moved horizontally at a per-cloud speed and wrapped
+   * when it leaves the viewport. Clouds sit at depth 0 (above bg landscape,
+   * below wall/castle/wizard). Mountains/forest/river are part of the bg PNG
+   * and do NOT move.
+   */
+  private drawClouds(): void {
+    // Bake a single cloud texture (puffy white blob w/ light grey underside)
+    // into a canvas texture, then instance it N times at varied y/scale/speed.
+    const cw = 64;
+    const ch = 28;
+    const key = "__cloud";
+    if (!this.textures.exists(key)) {
+      const ct = this.textures.createCanvas(key, cw, ch);
+      if (ct) {
+        const ctx = ct.context;
+        ctx.clearRect(0, 0, cw, ch);
+        // cloud = several overlapping white ellipses + a grey underside row
+        const puffs = [
+          { x: 12, y: 14, rx: 10, ry: 7 },
+          { x: 24, y: 10, rx: 14, ry: 9 },
+          { x: 40, y: 12, rx: 12, ry: 8 },
+          { x: 52, y: 15, rx: 9, ry: 6 },
+        ];
+        // underside shadow (soft grey-blue)
+        ctx.fillStyle = "#a8b8c8";
+        for (const p of puffs) {
+          ctx.beginPath();
+          ctx.ellipse(p.x, p.y + 3, p.rx, p.ry * 0.5, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        // white top
+        ctx.fillStyle = "#ffffff";
+        for (const p of puffs) {
+          ctx.beginPath();
+          ctx.ellipse(p.x, p.y, p.rx, p.ry, 0, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ct.refresh();
+      }
+    }
+    for (let i = 0; i < TUNING.CLOUD_COUNT; i++) {
+      const scale = Phaser.Math.FloatBetween(
+        TUNING.CLOUD_MIN_SCALE,
+        TUNING.CLOUD_MAX_SCALE,
       );
-      s.setScale(Phaser.Math.FloatBetween(0.6, 1.6));
-      s.setAlpha(Phaser.Math.FloatBetween(0.35, 0.9));
-      s.setDepth(0);
-      s.setTintFill(C.bone);
+      const y = Phaser.Math.Between(TUNING.CLOUD_MIN_Y, TUNING.CLOUD_MAX_Y);
+      const speed = Phaser.Math.FloatBetween(
+        TUNING.CLOUD_MIN_SPEED,
+        TUNING.CLOUD_MAX_SPEED,
+      );
+      const startX = Phaser.Math.Between(-cw * scale, TUNING.WIDTH);
+      const img = this.add.image(startX, y, key);
+      img.setScale(scale).setAlpha(TUNING.CLOUD_ALPHA).setDepth(0);
+      this.clouds.push({ img, speed });
+    }
+  }
+
+  /**
+   * Compact portal-castle tower. Draws a glowing cyan magical portal as a
+   * Graphics layer ON TOP of the existing castle.png (which is unchanged) but
+   * BELOW the wall strip + wizard (depth 1). The portal has:
+   *   - a vertical light beam rising above it
+   *   - a pulsing cyan core circle
+   *   - a slowly rotating rune ring
+   * Redrawn every frame in updatePortal() for the pulse/rotation animation.
+   */
+  private drawPortal(): void {
+    this.portalGfx = this.add.graphics();
+    // depth 1.5 = above castle (depth 1) + wall (depth 1), below wizard (depth 2)
+    // so the portal reads as "embedded in the castle wall".
+    this.portalGfx.setDepth(1.5);
+  }
+
+  /** Per-frame portal redraw: pulsing core + rotating rune ring + beam. */
+  private updatePortal(time: number): void {
+    if (!this.portalGfx) return;
+    const g = this.portalGfx;
+    g.clear();
+    const cx = TUNING.PORTAL_CX;
+    const cy = TUNING.PORTAL_CY;
+    const r = TUNING.PORTAL_R;
+    const ringR = TUNING.PORTAL_RING_R;
+    // pulse factor (0..1 sine)
+    const pulse = 0.5 + 0.5 * Math.sin((time / TUNING.PORTAL_PULSE_MS) * Math.PI * 2);
+    // vertical light beam (above portal, rising into the sky)
+    const beamH = TUNING.PORTAL_BEAM_H;
+    const beamW = TUNING.PORTAL_BEAM_W;
+    g.fillStyle(C.fxSpark, 0.10 + pulse * 0.06);
+    g.fillRect(cx - beamW, cy - r - beamH, beamW * 2, beamH);
+    g.fillStyle(C.fxSpark, 0.18 + pulse * 0.10);
+    g.fillRect(cx - beamW / 2, cy - r - beamH, beamW, beamH);
+    // outer glow halo
+    g.fillStyle(C.fxSpark, 0.12 + pulse * 0.08);
+    g.fillCircle(cx, cy, ringR + 6 + pulse * 3);
+    // rotating rune ring (8 small dots around the ring)
+    const rot = (time / TUNING.PORTAL_ROTATE_MS) * Math.PI * 2;
+    for (let i = 0; i < 8; i++) {
+      const a = rot + (i / 8) * Math.PI * 2;
+      const rx = cx + Math.cos(a) * ringR;
+      const ry = cy + Math.sin(a) * ringR;
+      g.fillStyle(C.fxSpark, 0.85);
+      g.fillRect(rx - 1, ry - 1, 2, 2);
+    }
+    // ring outline
+    g.lineStyle(1, C.fxSpark, 0.5 + pulse * 0.3);
+    g.strokeCircle(cx, cy, ringR);
+    // pulsing cyan core
+    g.fillStyle(C.fxSpark, 0.7 + pulse * 0.25);
+    g.fillCircle(cx, cy, r);
+    // bright inner core
+    g.fillStyle(0xffffff, 0.6 + pulse * 0.3);
+    g.fillCircle(cx, cy, r * 0.45);
+  }
+
+  /** Per-frame cloud drift: move each cloud right by speed*delta, wrap on exit. */
+  private updateClouds(deltaMs: number): void {
+    for (const c of this.clouds) {
+      c.img.x += c.speed * deltaMs;
+      // wrap: when the cloud's left edge passes the right viewport edge,
+      // reposition it just off the left edge. Use a generous margin so clouds
+      // fully exit before recycling (no pop-in).
+      const margin = c.img.width * c.img.scaleX + 20;
+      if (c.img.x - c.img.width * c.img.scaleX / 2 > TUNING.WIDTH + 10) {
+        c.img.x = -margin;
+      }
     }
   }
 
   private drawWall(): void {
-    const tileW = TUNING.WALL_TILE_W;
-    const y = TUNING.WALL_TOP_Y;
-    let variant = Phaser.Math.Between(0, 2);
-    for (let x = 0; x < TUNING.WIDTH; x += tileW) {
-      const t = this.add.image(x, y, "wall", variant);
-      t.setOrigin(0, 0);
-      t.setDepth(1);
-      variant = (variant + 1 + Phaser.Math.Between(0, 1)) % 3;
+    // Use the PNG wall strip if loaded, otherwise fall back to procedural tiles.
+    if (this.textures.exists("wall_strip")) {
+      const wall = this.add.image(0, TUNING.WALL_TOP_Y, "wall_strip");
+      wall.setOrigin(0, 0);
+      wall.setDepth(1);
+    } else {
+      const tileW = TUNING.WALL_TILE_W;
+      const y = TUNING.WALL_TOP_Y;
+      let variant = Phaser.Math.Between(0, 2);
+      for (let x = 0; x < TUNING.WIDTH; x += tileW) {
+        const t = this.add.image(x, y, "wall", variant);
+        t.setOrigin(0, 0);
+        t.setDepth(1);
+        variant = (variant + 1 + Phaser.Math.Between(0, 1)) % 3;
+      }
     }
   }
 
   private drawKeep(): void {
-    this.keepImg = this.add.image(
-      TUNING.KEEP_X,
-      TUNING.KEEP_BOTTOM_Y,
-      "keep",
-      0,
-    );
+    // Use the PNG castle if loaded, otherwise fall back to procedural keep.
+    const usePng = this.textures.exists("castle_png");
+    const castleKey = usePng ? "castle_png" : "keep";
+    // For single-frame PNG, don't pass a frame index (Phaser defaults to __BASE).
+    // For procedural spritesheet, pass frame 0 explicitly.
+    this.keepImg = usePng
+      ? this.add.image(TUNING.KEEP_X, TUNING.KEEP_BOTTOM_Y, castleKey)
+      : this.add.image(TUNING.KEEP_X, TUNING.KEEP_BOTTOM_Y, castleKey, 0);
     this.keepImg.setOrigin(0.5, 1);
-    this.keepImg.setScale(TUNING.KEEP_SCALE);
+    if (usePng) {
+      this.keepImg.setScale(1);
+    } else {
+      this.keepImg.setScale(TUNING.KEEP_SCALE);
+    }
     this.keepImg.setDepth(1);
   }
 
   private drawWizard(): void {
-    this.wiz = this.add.image(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y, "wiz", 0);
+    // Use the PNG texture "wiz_idle" (loaded in Boot preload) instead of the
+    // procedural "wiz" spritesheet. The idle bob tween moves the wizard's y
+    // position for the breathing animation (no frame swap needed — the PNG
+    // is a single idle frame; the procedural idle A/B frame swap is replaced
+    // by the y-bob which was already the primary visual).
+    const texKey = this.textures.exists("wiz_idle") ? "wiz_idle" : "wiz";
+    this.wiz = this.add.image(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y, texKey, 0);
     this.wiz.setOrigin(0.5, 1);
     this.wiz.setScale(TUNING.WIZ_SCALE);
     this.wiz.setDepth(2);
-    this.tweens.add({
+    this.wizIdleTween = this.tweens.add({
       targets: this.wiz,
+      y: TUNING.WIZ_BOTTOM_Y - 2,
       duration: 900,
       yoyo: true,
       repeat: -1,
       ease: "Sine.inOut",
-      onYoyo: () => {
-        if (this.wiz && this.wiz.active) this.wiz.setFrame(1);
-      },
-      onRepeat: () => {
-        if (this.wiz && this.wiz.active) this.wiz.setFrame(0);
-      },
     });
   }
 
   private drawMoon(): void {
-    this.moon = this.add.image(TUNING.MOON_X, TUNING.MOON_Y, "moon");
-    this.moon.setAlpha(TUNING.MOON_ALPHA);
-    this.moon.setDepth(0);
+    // DISABLED in daytime redesign (Task ID 12). Kept as a no-op stub so any
+    // external caller doesn't crash; the moon is intentionally never rendered.
+    void this;
   }
 
   private drawFlashRect(): void {
@@ -249,13 +445,22 @@ export default class Game extends Phaser.Scene {
 
   private refreshKeepFrame(): void {
     if (!this.keepImg) return;
-    const cracked = this.wallHP <= TUNING.KEEP_CRACK_HP_THRESHOLD;
-    this.keepImg.setFrame(cracked ? 1 : 0);
+    // Only setFrame if the texture has multiple frames (procedural keep has 2).
+    // The PNG castle is a single-frame image (frameTotal=1) — no frame switching.
+    const tex = this.keepImg.texture;
+    if (tex && tex.frameTotal > 2) {
+      const cracked = this.wallHP <= TUNING.KEEP_CRACK_HP_THRESHOLD;
+      this.keepImg.setFrame(cracked ? 1 : 0);
+    }
   }
 
   /* ----------------------------- update ------------------------------ */
 
   update(time: number, deltaMs: number): void {
+    // Ambient clouds + portal animate EVEN when paused/idle (they're decorative,
+    // not gameplay). This keeps the daytime scene alive on the title screen too.
+    this.updateClouds(deltaMs);
+    this.updatePortal(time);
     if (!this.running || this.paused) return;
 
     const cap = this.airborneCap();
@@ -280,19 +485,54 @@ export default class Game extends Phaser.Scene {
         w.baseX +
         Math.sin(time * TUNING.SWAY_FREQ_PER_MS + w.phase) *
           TUNING.SWAY_AMPLITUDE;
-      w.sprite.setFrame(Math.floor(time / 140) % 4);
+      // Animation: if the enemy is in death state and animDone, destroy and remove
+      if (w.animState === "death" && w.animDone) {
+        const di = this.wisps.indexOf(w);
+        if (di >= 0) this.wisps.splice(di, 1);
+        w.container.destroy();
+        continue;
+      }
+      // If in attack state and animDone, process wall hit
+      if (w.animState === "attack" && w.animDone) {
+        // Attack animation complete; now apply wall damage
+        this.wallHit(w);
+        continue;
+      }
+      // Skip normal movement for death/attack states
+      if (w.animState === "death" || w.animState === "attack") continue;
+
+      // Normal movement (enter + idle states)
+      w.container.y += w.speedPerMs * deltaMs;
+      w.container.x =
+        w.baseX +
+        Math.sin(time * TUNING.SWAY_FREQ_PER_MS + w.phase) *
+          TUNING.SWAY_AMPLITUDE;
+
+      // Frame animation: only for procedural fallback textures (no Phaser anim).
+      // PNG spritesheets use the Phaser animation system (playWispAnim).
+      const tex = w.sprite.texture;
+      const animKey = `${tex.key}_idle`;
+      if (w.animState === "idle" && !this.anims.exists(animKey) && tex && tex.frameTotal > 1) {
+        // Procedural fallback: manual flutter
+        w.sprite.setFrame(Math.floor(time / 140) % 4);
+      }
+
       w.trailTimer += deltaMs;
       if (w.trailTimer >= TUNING.WISP_TRAIL_INTERVAL_MS) {
         w.trailTimer = 0;
         this.spawnWispTrail(w);
       }
       if (w.container.y >= TUNING.WALL_CONTACT_Y) {
-        this.wallHit(w);
+        // Switch to attack state — the wall hit logic runs when attack anim completes
+        w.animState = "attack";
+        w.animDone = false;
+        this.playWispAnim(w, "attack");
+        // If no attack animation exists (fallback), resolve immediately
+        if (!this.anims.exists(`${w.sprite.texture.key}_attack`)) {
+          this.wallHit(w);
+        }
       }
     }
-
-    const lowest = this.getLowest();
-    for (const w of this.wisps) w.ring.setVisible(w === lowest);
   }
 
   private airborneCap(): number {
@@ -303,7 +543,95 @@ export default class Game extends Phaser.Scene {
     return cfg.airborne[cfg.airborne.length - 1].cap;
   }
 
-  /* ----------------------------- wisps ------------------------------- */
+  /* --------------------- enemy animation system --------------------- */
+
+  /** Register Phaser animations for each enemy type's enter/idle/attack/death states. */
+  private registerEnemyAnimations(): void {
+    for (const key of ENEMY_KEYS) {
+      const ranges = ENEMY_FRAME_RANGES[key];
+      if (!ranges) continue;
+      // Only register if the texture exists and has enough frames
+      if (!this.textures.exists(key)) continue;
+      const tex = this.textures.get(key);
+      const totalFrames = tex.frameTotal - 1; // subtract __BASE
+      if (totalFrames < ranges[7] + 1) continue; // not enough frames
+
+      const [eS, eE, iS, iE, aS, aE, dS, dE] = ranges;
+      // Enter: play once, then transition to idle
+      this.anims.create({
+        key: `${key}_enter`,
+        frames: this.anims.generateFrameNumbers(key, { start: eS, end: eE }),
+        frameRate: 10,
+        repeat: 0,
+      });
+      // Idle: loop
+      this.anims.create({
+        key: `${key}_idle`,
+        frames: this.anims.generateFrameNumbers(key, { start: iS, end: iE }),
+        frameRate: 4,
+        repeat: -1,
+      });
+      // Attack: play once
+      this.anims.create({
+        key: `${key}_attack`,
+        frames: this.anims.generateFrameNumbers(key, { start: aS, end: aE }),
+        frameRate: 8,
+        repeat: 0,
+      });
+      // Death: play once, then mark done
+      this.anims.create({
+        key: `${key}_death`,
+        frames: this.anims.generateFrameNumbers(key, { start: dS, end: dE }),
+        frameRate: 8,
+        repeat: 0,
+      });
+    }
+  }
+
+  /** Start an animation on a wisp sprite, handling fallback to procedural textures. */
+  private playWispAnim(w: Wisp, state: "enter" | "idle" | "attack" | "death"): void {
+    const animKey = `${w.sprite.texture.key}_${state}`;
+    if (this.anims.exists(animKey)) {
+      // Phaser Image doesn't have .play() — use the Sprite-based approach
+      // by stopping any current anim and using the texture's frames directly
+      // via the animation manager
+      const anim = this.anims.get(animKey);
+      if (anim) {
+        // Manual frame stepping for Image objects (which don't have .play())
+        let frameIdx = anim.frames[0].frame;
+        w.sprite.setFrame(frameIdx);
+        // Set up a timer-based frame cycle
+        const frames = anim.frames;
+        let currentFrame = 0;
+        const frameRate = anim.frameRate || 4;
+        const frameMs = 1000 / frameRate;
+        // Clear any existing timer for this wisp
+        // Use a simple recursive delayedCall approach
+        const stepFrame = () => {
+          if (w.animState !== state) return; // state changed, stop stepping
+          currentFrame = (currentFrame + 1) % frames.length;
+          if (currentFrame === 0 && anim.repeat === 0) {
+            // Non-repeating animation completed
+            if (state === "enter") {
+              w.animState = "idle";
+              this.playWispAnim(w, "idle");
+            } else if (state === "death") {
+              w.animDone = true;
+            } else if (state === "attack") {
+              w.animDone = true;
+            }
+            return;
+          }
+          w.sprite.setFrame(frames[currentFrame].frame);
+          this.time.delayedCall(frameMs, stepFrame);
+        };
+        this.time.delayedCall(frameMs, stepFrame);
+      }
+    } else {
+      // Fallback: procedural textures had 4 flutter frames; just set frame 0
+      w.sprite.setFrame(0);
+    }
+  }
 
   private spawnWisp(): void {
     const q = this.generateQuestion();
@@ -319,43 +647,50 @@ export default class Game extends Phaser.Scene {
     const container = this.add.container(baseX, TUNING.WISP_SPAWN_Y);
     container.setDepth(3);
 
-    const variant = WISP_KEYS[Phaser.Math.Between(0, 2)];
-    const sprite = this.add.image(0, 0, variant, 0);
+    // Pick one of 4 enemy variants at random; use PNG texture if loaded,
+    // otherwise fall back to procedural wisp texture.
+    const idx = Phaser.Math.Between(0, ENEMY_KEYS.length - 1);
+    const pngKey = ENEMY_KEYS[idx];
+    const fallbackKey = FALLBACK_KEYS[idx];
+    const texKey = this.textures.exists(pngKey) ? pngKey : fallbackKey;
+    const sprite = this.add.image(0, 0, texKey, 0);
     sprite.setOrigin(0.5, 0.5);
     sprite.setScale(TUNING.WISP_SCALE);
     container.add(sprite);
 
+    // Question bubble — cream rounded rect with thin dark outline + dark ink
+    // text (matches the reference's speech-bubble style). A small pointer
+    // triangle below connects the bubble to the enemy.
     const questionText = this.add
       .text(0, TUNING.QUESTION_OFFSET_Y, q.question, {
         fontFamily: FONT,
         fontSize: TUNING.QUESTION_FONT_SIZE,
-        color: PALETTE.bone,
+        color: PALETTE.ink,
         align: "center",
+        backgroundColor: PALETTE.bone,
+        padding: { x: 6, y: 3 },
       })
       .setOrigin(0.5);
     questionText.setAlpha(1);
     container.add(questionText);
 
-    const ring = this.add.graphics();
-    ring.lineStyle(2, C.ember, 1);
-    ring.strokeCircle(0, 0, 18);
-    ring.setVisible(false);
-    container.add(ring);
-
     const wisp: Wisp = {
       container,
       sprite,
       questionText,
-      ring,
-      variant: variant === "wisp_a" ? "a" : variant === "wisp_b" ? "b" : "c",
+      variant: (["a", "b", "c", "d"] as const)[idx],
       question: q.question,
       answer: q.answer,
       baseX,
       phase: Math.random() * Math.PI * 2,
       speedPerMs,
       trailTimer: 0,
+      animState: "enter",
+      animDone: false,
     };
     this.wisps.push(wisp);
+    // Start the enter animation
+    this.playWispAnim(wisp, "enter");
     this.emitHud();
   }
 
@@ -444,6 +779,8 @@ export default class Game extends Phaser.Scene {
 
     let target: Wisp | null = null;
     for (const w of this.wisps) {
+      // Skip enemies in death/attack state — they can't be hit again
+      if (w.animState === "death" || w.animState === "attack") continue;
       if (w.answer === digit) {
         if (!target || w.container.y > target.container.y) target = w;
       }
@@ -457,29 +794,50 @@ export default class Game extends Phaser.Scene {
     const x = w.container.x;
     const y = w.container.y;
 
-    const idx = this.wisps.indexOf(w);
-    if (idx >= 0) this.wisps.splice(idx, 1);
-    w.ring.setVisible(false);
-    this.tweens.add({
-      targets: w.sprite,
-      scaleX: TUNING.WISP_SCALE * TUNING.POP_SCALE,
-      scaleY: TUNING.WISP_SCALE * TUNING.POP_SCALE,
-      alpha: 0,
-      duration: TUNING.POP_DURATION,
-      ease: "Quad.out",
-      onComplete: () => w.container.destroy(),
-    });
+    // Switch to death animation state — enemy is no longer targetable
+    w.animState = "death";
+    w.animDone = false;
+
+    // Hide the question text immediately
     this.tweens.add({
       targets: w.questionText,
       alpha: 0,
       duration: TUNING.POP_DURATION,
     });
 
+    // Play death animation; when done, destroy the container
+    const deathAnimKey = `${w.sprite.texture.key}_death`;
+    if (this.anims.exists(deathAnimKey)) {
+      this.playWispAnim(w, "death");
+      // Check each frame if death is done (animDone set by completion callback)
+      const checkDeath = () => {
+        if (w.animDone) {
+          w.container.destroy();
+        } else {
+          this.time.delayedCall(50, checkDeath);
+        }
+      };
+      this.time.delayedCall(100, checkDeath);
+    } else {
+      // Fallback: procedural pop + fade (original behavior)
+      const idx = this.wisps.indexOf(w);
+      if (idx >= 0) this.wisps.splice(idx, 1);
+      this.tweens.add({
+        targets: w.sprite,
+        scaleX: TUNING.WISP_SCALE * TUNING.POP_SCALE,
+        scaleY: TUNING.WISP_SCALE * TUNING.POP_SCALE,
+        alpha: 0,
+        duration: TUNING.POP_DURATION,
+        ease: "Quad.out",
+        onComplete: () => w.container.destroy(),
+      });
+    }
+
     SFX.play("kill");
     // dispatch the ten-element spell effect (cosmetic only)
     this.castFx(digit, x, y);
     this.spawnFloatPlus(x, y);
-    this.pulseWiz();
+    this.playWizardCast(digit);
 
     this.score += TUNING.SCORE_PER_CAST;
     this.streak += 1;
@@ -506,6 +864,9 @@ export default class Game extends Phaser.Scene {
     const sx = lowest ? lowest.container.x : TUNING.WIDTH / 2;
     const sy = lowest ? lowest.container.y : TUNING.WALL_CONTACT_Y - 40;
     this.spawnSparkle(sx, sy, C.ember, 6, TUNING.FIZZLE_SPARKLE_LIFE_MS);
+
+    // Wizard wrong-answer reaction (shake + ember tint)
+    this.playWrongAnswerReaction();
 
     // BACKLASH (veryHard only): a wrong cast deals 1 wallHP to the keep.
     if (this.levelCfg.backlash) {
@@ -537,6 +898,10 @@ export default class Game extends Phaser.Scene {
       this.cameras.main.shake(TUNING.SHAKE_DURATION, TUNING.SHAKE_INTENSITY);
     }
     this.refreshKeepFrame();
+
+    // Wizard castle-hit reaction (recoil + red tint)
+    this.playCastleHitReaction();
+
     if (this.wallHP <= 0) {
       this.gameover();
       return;
@@ -604,9 +969,270 @@ export default class Game extends Phaser.Scene {
 
   private pulseWiz(): void {
     if (!this.wiz || !this.wiz.active) return;
-    this.wiz.setFrame(2);
+    this.setWizCastTexture();
     this.time.delayedCall(TUNING.WIZ_PULSE_MS, () => {
-      if (this.wiz && this.wiz.active) this.wiz.setFrame(0);
+      if (this.wiz && this.wiz.active) this.setWizIdleTexture();
+    });
+  }
+
+  /**
+   * Play the digit-specific wizard cast animation.
+   *
+   * Validates digit is 0-9, then:
+   *   1. Wind-up: wizard switches to cast frame (frame 2) for SPELL_WINDUP_MS.
+   *   2. Release: the spell overlay PNG (spell_<digit>) appears at the staff tip.
+   *   3. Hold: the overlay is visible for SPELL_HOLD_MS.
+   *   4. Recovery: overlay fades over SPELL_FADE_MS, wizard returns to idle (frame 0).
+   *
+   * Prevents overlapping casts: if a cast is in progress, the previous spell
+   * overlay is destroyed before starting the new one. The wizard always
+   * returns to idle (frame 0) at the end.
+   */
+  private playWizardCast(digit: number): void {
+    if (!this.wiz || !this.wiz.active) return;
+    if (!Number.isInteger(digit) || digit < 0 || digit > 9) {
+      console.warn(`[Game] playWizardCast: invalid digit ${digit}, ignoring`);
+      return;
+    }
+    // Game-over has the highest priority — never start a cast during defeat
+    if (this.wizAnimState === "gameover") return;
+
+    // Cancel any in-progress cast overlay
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    // Cancel any in-progress reaction tween
+    this.cancelWizReaction();
+
+    // Wind-up: switch wizard to cast texture
+    this.wizAnimState = "casting";
+    this.setWizCastTexture();
+
+    // After wind-up, show the spell effect at the staff tip
+    this.time.delayedCall(TUNING.SPELL_WINDUP_MS, () => {
+      if (!this.wiz || !this.wiz.active) return;
+
+      const spellKey = `spell_${digit}`;
+      if (!this.textures.exists(spellKey)) {
+        console.warn(`[Game] spell texture "${spellKey}" not loaded`);
+        return;
+      }
+
+      // Create the spell overlay at the staff tip
+      const overlay = this.add.image(
+        TUNING.STAFF_TIP_X,
+        TUNING.STAFF_TIP_Y,
+        spellKey,
+      );
+      overlay.setOrigin(0.5, 0.5);
+      overlay.setScale(TUNING.WIZ_SCALE); // match wizard's 3x display scale
+      overlay.setDepth(4); // above wall (1), below wisp container (3)... actually above
+      overlay.setAlpha(0);
+      this.activeSpellOverlay = overlay;
+
+      // Quick scale-in + fade-in
+      this.tweens.add({
+        targets: overlay,
+        alpha: 1,
+        scale: TUNING.WIZ_SCALE * 1.2,
+        duration: 50,
+        ease: "Quad.out",
+        onComplete: () => {
+          // Hold phase
+          this.tweens.add({
+            targets: overlay,
+            scale: TUNING.WIZ_SCALE,
+            duration: TUNING.SPELL_HOLD_MS,
+            ease: "Sine.inOut",
+            onComplete: () => {
+              // Fade-out
+              this.tweens.add({
+                targets: overlay,
+                alpha: 0,
+                scale: TUNING.WIZ_SCALE * 0.5,
+                duration: TUNING.SPELL_FADE_MS,
+                ease: "Quad.in",
+                onComplete: () => {
+                  overlay.destroy();
+                  if (this.activeSpellOverlay === overlay) {
+                    this.activeSpellOverlay = null;
+                  }
+                },
+              });
+            },
+          });
+        },
+      });
+
+      // Recovery: wizard returns to idle after the total cast duration
+      this.time.delayedCall(
+        TUNING.SPELL_WINDUP_MS + TUNING.SPELL_HOLD_MS + TUNING.SPELL_FADE_MS,
+        () => {
+          if (this.wiz && this.wiz.active && this.wizAnimState === "casting") {
+            this.setWizIdleTexture();
+            this.resumeWizIdle();
+          }
+        },
+      );
+    });
+  }
+
+  /* ------------------- wizard reaction animations ------------------- */
+
+  /** Switch the wizard to the idle PNG texture (or procedural fallback). */
+  private setWizIdleTexture(): void {
+    if (!this.wiz || !this.wiz.active) return;
+    if (this.textures.exists("wiz_idle")) {
+      this.wiz.setTexture("wiz_idle");
+    } else {
+      this.wiz.setTexture("wiz", 0);
+    }
+  }
+
+  /** Switch the wizard to the cast PNG texture (or procedural fallback). */
+  private setWizCastTexture(): void {
+    if (!this.wiz || !this.wiz.active) return;
+    if (this.textures.exists("wiz_cast")) {
+      this.wiz.setTexture("wiz_cast");
+    } else {
+      this.wiz.setTexture("wiz", 2);
+    }
+  }
+
+  /** Cancel any in-progress reaction tween on the wizard. */
+  private cancelWizReaction(): void {
+    if (this.wizReactionTween && this.wizReactionTween.isActive()) {
+      this.wizReactionTween.remove();
+    }
+    this.wizReactionTween = null;
+  }
+
+  /** Resume idle animation (pause lifted, frame reset, state set to idle). */
+  private resumeWizIdle(): void {
+    if (this.wizAnimState === "gameover") return; // don't resume during defeat
+    this.wizAnimState = "idle";
+    if (this.wiz && this.wiz.active) {
+      this.wiz.clearTint();
+      this.setWizIdleTexture();
+      this.wiz.setPosition(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y);
+      this.wiz.setAlpha(1);
+    }
+    if (this.wizIdleTween && this.wizIdleTween.isPaused()) {
+      this.wizIdleTween.resume();
+    }
+  }
+
+  /**
+   * Castle-hit reaction: brief backward recoil + red/ember tint flash.
+   * ~200ms. Triggered when an enemy damages the castle (wallHit).
+   * Priority: castleHit > casting. Cancels any active cast.
+   */
+  private playCastleHitReaction(): void {
+    if (!this.wiz || !this.wiz.active) return;
+    if (this.wizAnimState === "gameover") return; // gameover is terminal
+
+    // Cancel any active cast overlay
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    this.cancelWizReaction();
+
+    this.wizAnimState = "castleHit";
+    if (this.wizIdleTween) this.wizIdleTween.pause();
+
+    // Red/ember tint flash + backward recoil
+    this.wiz.setTint(0xff6b35); // ember tint
+    const origX = TUNING.WIZ_X;
+    this.wizReactionTween = this.tweens.add({
+      targets: this.wiz,
+      x: origX - TUNING.WIZ_HIT_RECOIL,
+      duration: TUNING.WIZ_HIT_MS / 2,
+      ease: "Quad.out",
+      yoyo: true,
+      onComplete: () => {
+        this.wiz.clearTint();
+        this.wiz.setPosition(origX, TUNING.WIZ_BOTTOM_Y);
+        this.resumeWizIdle();
+      },
+    });
+  }
+
+  /**
+   * Wrong-answer reaction: small head/body shake + ember tint.
+   * ~280ms. Triggered when the player submits an incorrect answer.
+   * Priority: wrongAnswer > casting (but < castleHit). Cancels active cast.
+   */
+  private playWrongAnswerReaction(): void {
+    if (!this.wiz || !this.wiz.active) return;
+    if (this.wizAnimState === "gameover") return;
+    if (this.wizAnimState === "castleHit") return; // castle hit takes priority
+
+    // Cancel any active cast overlay
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    this.cancelWizReaction();
+
+    this.wizAnimState = "wrongAnswer";
+    if (this.wizIdleTween) this.wizIdleTween.pause();
+
+    // Shake: x oscillation + slight ember tint
+    this.wiz.setTint(0xff6b35);
+    const origX = TUNING.WIZ_X;
+    const shake = TUNING.WIZ_WRONG_SHAKE;
+    this.wizReactionTween = this.tweens.add({
+      targets: this.wiz,
+      x: origX + shake,
+      duration: 60,
+      repeat: 3,
+      yoyo: true,
+      ease: "Sine.inOut",
+      onComplete: () => {
+        this.wiz.clearTint();
+        this.wiz.setPosition(origX, TUNING.WIZ_BOTTOM_Y);
+        this.resumeWizIdle();
+      },
+    });
+  }
+
+  /**
+   * Game-over defeat animation: staff dim, slump, fade.
+   * ~700ms. Plays once when the game ends. Terminal — wizard does NOT
+   * return to idle afterward. Has the highest priority.
+   */
+  private playGameOverAnimation(): void {
+    if (!this.wiz || !this.wiz.active) return;
+
+    // Cancel everything: spell overlay, reaction tween, idle tween
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    this.cancelWizReaction();
+    if (this.wizIdleTween && this.wizIdleTween.isActive()) {
+      this.wizIdleTween.pause();
+    }
+
+    this.wizAnimState = "gameover";
+
+    // Staff crystal dim (tint to ink), body slump (drop + lean), then fade
+    this.wiz.setTint(0x2b241e); // inkHi — dark/dimmed
+    this.setWizIdleTexture();
+
+    const origY = TUNING.WIZ_BOTTOM_Y;
+    this.wizReactionTween = this.tweens.add({
+      targets: this.wiz,
+      y: origY + TUNING.WIZ_DEFEAT_DROP, // slump downward
+      alpha: 0.2, // almost fade out
+      duration: TUNING.WIZ_DEFEAT_MS,
+      ease: "Quad.in",
+      onComplete: () => {
+        // Wizard stays dimmed/faded; React game-over UI appears on top.
+        // The wizard will be fully restored on resetRun().
+      },
     });
   }
 
@@ -992,6 +1618,9 @@ export default class Game extends Phaser.Scene {
     this.running = false;
     SFX.play("gameover");
 
+    // Wizard defeat animation (staff dim + slump + fade, ~700ms, plays once)
+    this.playGameOverAnimation();
+
     const elapsedMin = Math.max(
       0.0001,
       (this.time.now - this.runStartTime) / 60000,
@@ -1045,6 +1674,24 @@ export default class Game extends Phaser.Scene {
     this.wisps = [];
     for (const s of this.trailSpecks) s.destroy();
     this.trailSpecks = [];
+
+    // Restore wizard to full idle state
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    this.cancelWizReaction();
+    this.wizAnimState = "idle";
+    if (this.wiz && this.wiz.active) {
+      this.wiz.clearTint();
+      this.setWizIdleTexture();
+      this.wiz.setPosition(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y);
+      this.wiz.setAlpha(1);
+      this.wiz.setScale(TUNING.WIZ_SCALE);
+    }
+    if (this.wizIdleTween && this.wizIdleTween.isPaused()) {
+      this.wizIdleTween.resume();
+    }
 
     this.wallHP = TUNING.WALL_HP;
     this.score = 0;
@@ -1144,6 +1791,18 @@ export default class Game extends Phaser.Scene {
       const kb = this.input?.keyboard;
       if (kb && this.boundKeyDown) kb.off("keydown", this.boundKeyDown);
     }
+    if (this.activeSpellOverlay) {
+      this.activeSpellOverlay.destroy();
+      this.activeSpellOverlay = null;
+    }
+    // Clean up clouds + portal graphics (UI-redesign Task ID 12).
+    this.clouds.forEach((c) => c.img.destroy());
+    this.clouds = [];
+    if (this.portalGfx) {
+      this.portalGfx.destroy();
+      this.portalGfx = null;
+    }
+    this.cancelWizReaction();
     this.running = false;
   }
 }

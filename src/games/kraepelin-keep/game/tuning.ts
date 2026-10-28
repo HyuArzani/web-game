@@ -85,9 +85,38 @@ export const TUNING = {
   WIZ_SCALE: 3,
 
   // Moon (28x28). Fixed top-right in the sky.
+  // NOTE: Moon is DISABLED in the daytime redesign — see CLOUDS + PORTAL below.
+  // The moon field is kept for backward-compat but Game.ts no longer renders it.
   MOON_X: 470,
   MOON_Y: 90,
   MOON_ALPHA: 0.85,
+
+  // ---- Daytime clouds (added in UI-redesign task) ----
+  // Procedural cloud sprites drift horizontally at varied speeds + wrap.
+  CLOUD_COUNT: 5,
+  CLOUD_MIN_SCALE: 1.2,
+  CLOUD_MAX_SCALE: 2.6,
+  CLOUD_MIN_SPEED: 0.008, // px/ms (slow)
+  CLOUD_MAX_SPEED: 0.022,
+  CLOUD_MIN_Y: 60,
+  CLOUD_MAX_Y: 260,
+  CLOUD_ALPHA: 0.92,
+
+  // ---- Portal-castle tower (added in UI-redesign task) ----
+  // A compact castle tower rises BEHIND the wall (between bg and wall).
+  // The glowing portal is the focal point. The existing castle.png is drawn
+  // first; the portal layer is drawn on top of the castle, below the wall.
+  // castle.png is 200x197, positioned at KEEP_X=270, bottom-y=810, origin (0.5,1)
+  // → spans x:170-370, y:613-810. The portal sits on the upper-middle wall
+  // face (sprite-y ≈ 125 → game-y ≈ 738).
+  PORTAL_CX: 270, // center x of the portal (= KEEP_X)
+  PORTAL_CY: 738, // center y of the portal (upper-middle castle wall)
+  PORTAL_R: 16, // portal core radius (px)
+  PORTAL_RING_R: 24, // outer rotating ring radius
+  PORTAL_PULSE_MS: 1800, // pulse cycle duration
+  PORTAL_ROTATE_MS: 6000, // rune ring rotation period
+  PORTAL_BEAM_H: 90, // vertical beam height above portal
+  PORTAL_BEAM_W: 7, // beam width
 
   // ---- Wisp sway (sine) ----
   SWAY_AMPLITUDE: 28,
@@ -137,6 +166,21 @@ export const TUNING = {
   EMBER_BLINK_ALPHA: 0.10,
   EMBER_BLINK_MS: 95,
   WIZ_PULSE_MS: 120,
+  // Wizard spell-cast animation (per-digit spell overlay at the staff tip)
+  SPELL_CAST_MS: 350, // total cast animation duration (~250-450ms range)
+  SPELL_WINDUP_MS: 80, // wind-up before the spell effect appears
+  SPELL_HOLD_MS: 200, // spell effect visible duration
+  SPELL_FADE_MS: 70, // spell effect fade-out
+  // Staff tip position in game coords (where spell effects appear)
+  STAFF_TIP_X: 82, // WIZ_X + (16-12)*WIZ_SCALE = 70 + 12
+  STAFF_TIP_Y: 726, // WIZ_BOTTOM_Y - (32-4)*WIZ_SCALE = 810 - 84
+  // Wizard reaction animations (tween-based, no new PNGs needed)
+  WIZ_HIT_MS: 200, // castle-hit reaction: recoil + red tint
+  WIZ_HIT_RECOIL: 6, // px backward recoil
+  WIZ_WRONG_MS: 280, // wrong-answer reaction: shake + ember tint
+  WIZ_WRONG_SHAKE: 3, // px shake amplitude
+  WIZ_DEFEAT_MS: 700, // game-over defeat: slump + fade
+  WIZ_DEFEAT_DROP: 8, // px downward slump
   RED_BLINK_ALPHA: 0.08,
   RED_BLINK_MS: 90,
   FIZZLE_SPARKLE_LIFE_MS: 260,
