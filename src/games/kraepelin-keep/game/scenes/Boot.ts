@@ -5,9 +5,9 @@ import { bakeAll } from "../pixelart";
  * Boot scene — loads external PNG assets (wizard sprites + spell overlays),
  * bakes procedural pixel sprites as fallback, then hands off to Game.
  *
- * The wizard PNGs (wiz_idle, wiz_cast) replace the procedural "wiz" texture
- * for rendering. The procedural "wiz" is still baked as a fallback but the
- * Game scene uses the PNG textures by default.
+ * The wizard PNG sheets (wiz_idle, wiz_cast, wiz_gameover) replace the
+ * procedural "wiz" texture for rendering. The procedural "wiz" is still
+ * baked as a fallback.
  */
 export default class Boot extends Phaser.Scene {
   constructor() {
@@ -15,15 +15,25 @@ export default class Boot extends Phaser.Scene {
   }
 
   preload(): void {
-    // Load the wizard PNG sprites (24x32 transparent RGBA).
-    this.load.image("wiz_idle", "sprites/wizard/wiz_idle_a.png");
-    this.load.image("wiz_cast", "sprites/wizard/wiz_cast_1.png");
+    // Load the wizard PNG spritesheets (64x64 transparent RGBA).
+    this.load.spritesheet("wiz_idle", "sprites/pixel-wizard/wizard_idle.png", {
+      frameWidth: 64,
+      frameHeight: 64,
+    });
+    this.load.spritesheet("wiz_cast", "sprites/pixel-wizard/wizard_cast.png", {
+      frameWidth: 64,
+      frameHeight: 64,
+    });
+    this.load.spritesheet("wiz_gameover", "sprites/pixel-wizard/wizard_gameover.png", {
+      frameWidth: 64,
+      frameHeight: 64,
+    });
 
-    // Load the 4 enemy PNG spritesheets (24x24 per frame, transparent RGBA).
-    this.load.spritesheet("enemy_a", "sprites/enemies/goblin_jetpack_sheet.png", { frameWidth: 24, frameHeight: 24 });
-    this.load.spritesheet("enemy_b", "sprites/enemies/slime_flyer_sheet.png", { frameWidth: 24, frameHeight: 24 });
-    this.load.spritesheet("enemy_c", "sprites/enemies/skeleton_wraith_sheet.png", { frameWidth: 24, frameHeight: 24 });
-    this.load.spritesheet("enemy_d", "sprites/enemies/shadow_bat_sheet.png", { frameWidth: 24, frameHeight: 24 });
+    // Load the 4 enemy PNG spritesheets (48x48 per frame, transparent RGBA).
+    this.load.spritesheet("enemy_a", "sprites/pixel-wizard/goblin_jetpack.png", { frameWidth: 48, frameHeight: 48 });
+    this.load.spritesheet("enemy_b", "sprites/pixel-wizard/slime_flyer.png", { frameWidth: 48, frameHeight: 48 });
+    this.load.spritesheet("enemy_c", "sprites/pixel-wizard/skeleton_wraith.png", { frameWidth: 48, frameHeight: 48 });
+    this.load.spritesheet("enemy_d", "sprites/pixel-wizard/shadow_bat.png", { frameWidth: 48, frameHeight: 48 });
 
     // Load the 10 spell-effect overlay PNGs (20x20 transparent).
     for (let d = 0; d <= 9; d++) {
@@ -40,8 +50,7 @@ export default class Boot extends Phaser.Scene {
 
   create(): void {
     // Bake procedural sprites as fallback (wisp, keep, wall, moon, star, wiz).
-    // The procedural "wiz" key is kept but Game.ts uses "wiz_idle"/"wiz_cast"
-    // PNG textures for the actual wizard rendering.
+    // The procedural "wiz" key remains as a fallback for wizard rendering.
     try {
       bakeAll(this);
     } catch (e) {

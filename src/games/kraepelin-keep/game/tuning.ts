@@ -79,7 +79,7 @@ export const TUNING = {
   KEEP_SCALE: 2,
   KEEP_CRACK_HP_THRESHOLD: 2,
 
-  // Wizard (24x32 @3x = 72x96). Stands on the wall, bottom-left (flavor).
+  // Wizard (64x64 frames @3x). Stands on the wall, bottom-left (flavor).
   WIZ_X: 70,
   WIZ_BOTTOM_Y: 810,
   WIZ_SCALE: 3,

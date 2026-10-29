@@ -55,18 +55,14 @@ const C = {
 const ENEMY_KEYS = ["enemy_a", "enemy_b", "enemy_c", "enemy_d"];
 const FALLBACK_KEYS = ["wisp_a", "wisp_b", "wisp_c", "wisp_a"];
 
-// Animation frame ranges per enemy type [enterStart, enterEnd, idleStart, idleEnd, attackStart, attackEnd, deathStart, deathEnd]
-// Frame layout in each spritesheet: enter, idle, attack, death (contiguous).
-// These match the recreated clean pixel-art sheets (see scripts/sprites/gen_sprites.py):
-//   enemy_a (goblin_jetpack): 16 frames = 4 enter + 4 idle + 3 attack + 5 death  (384x24)
-//   enemy_b (slime_flyer):    13 frames = 3 enter + 3 idle + 3 attack + 4 death  (312x24)
-//   enemy_c (skeleton_wraith): 13 frames = 3 enter + 3 idle + 3 attack + 4 death (312x24)
-//   enemy_d (shadow_bat):     14 frames = 3 enter + 4 idle + 3 attack + 4 death  (336x24)
+// Animation frame ranges per enemy type [enterStart, enterEnd, idleStart, idleEnd, attackStart, attackEnd, deathStart, deathEnd].
+// The generated sheets arrange enter, idle, attack, and death in consecutive rows.
+// Goblin uses a 4x4 grid; the other enemies use 3x4 grids.
 const ENEMY_FRAME_RANGES: Record<string, [number, number, number, number, number, number, number, number]> = {
-  enemy_a: [0, 3, 4, 7, 8, 10, 11, 15],    // goblin: 16 frames (4 enter, 4 idle, 3 attack, 5 death)
-  enemy_b: [0, 2, 3, 5, 6, 8, 9, 12],     // slime: 13 frames (3 enter, 3 idle, 3 attack, 4 death)
-  enemy_c: [0, 2, 3, 5, 6, 8, 9, 12],     // wraith: 13 frames (3 enter, 3 idle, 3 attack, 4 death)
-  enemy_d: [0, 2, 3, 6, 7, 9, 10, 13],    // bat: 14 frames (3 enter, 4 idle, 3 attack, 4 death)
+  enemy_a: [0, 3, 4, 7, 8, 11, 12, 15],
+  enemy_b: [0, 2, 3, 5, 6, 8, 9, 11],
+  enemy_c: [0, 2, 3, 5, 6, 8, 9, 11],
+  enemy_d: [0, 2, 3, 5, 6, 8, 9, 11],
 };
 
 /**
@@ -123,7 +119,7 @@ export default class Game extends Phaser.Scene {
   private inputLockUntil = 0;
 
   // objects
-  private wiz!: Phaser.GameObjects.Image;
+  private wiz!: Phaser.GameObjects.Sprite;
   private keepImg!: Phaser.GameObjects.Image;
   private moon: Phaser.GameObjects.Image | null = null; // disabled in daytime redesign
   private flashRect!: Phaser.GameObjects.Rectangle;
@@ -167,6 +163,7 @@ export default class Game extends Phaser.Scene {
     this.drawWall();
     this.drawKeep();
     this.drawPortal(); // portal layer on top of castle, below wall/wizard
+    this.registerWizardAnimations();
     this.drawWizard();
     // Moon is DISABLED in the daytime redesign (Task ID 12).
     this.drawFlashRect();
@@ -403,16 +400,13 @@ export default class Game extends Phaser.Scene {
   }
 
   private drawWizard(): void {
-    // Use the PNG texture "wiz_idle" (loaded in Boot preload) instead of the
-    // procedural "wiz" spritesheet. The idle bob tween moves the wizard's y
-    // position for the breathing animation (no frame swap needed — the PNG
-    // is a single idle frame; the procedural idle A/B frame swap is replaced
-    // by the y-bob which was already the primary visual).
+    // The PNG sheet provides the idle animation; retain the y-bob tween.
     const texKey = this.textures.exists("wiz_idle") ? "wiz_idle" : "wiz";
-    this.wiz = this.add.image(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y, texKey, 0);
+    this.wiz = this.add.sprite(TUNING.WIZ_X, TUNING.WIZ_BOTTOM_Y, texKey, 0);
     this.wiz.setOrigin(0.5, 1);
     this.wiz.setScale(TUNING.WIZ_SCALE);
     this.wiz.setDepth(2);
+    this.setWizIdleTexture();
     this.wizIdleTween = this.tweens.add({
       targets: this.wiz,
       y: TUNING.WIZ_BOTTOM_Y - 2,
@@ -545,6 +539,34 @@ export default class Game extends Phaser.Scene {
 
   /* --------------------- enemy animation system --------------------- */
 
+  /** Register looping/one-shot animations for the wizard spritesheets. */
+  private registerWizardAnimations(): void {
+    if (this.textures.exists("wiz_idle")) {
+      this.anims.create({
+        key: "wiz_idle_anim",
+        frames: this.anims.generateFrameNumbers("wiz_idle", { start: 0, end: 3 }),
+        frameRate: 6,
+        repeat: -1,
+      });
+    }
+    if (this.textures.exists("wiz_cast")) {
+      this.anims.create({
+        key: "wiz_cast_anim",
+        frames: this.anims.generateFrameNumbers("wiz_cast", { start: 0, end: 3 }),
+        frameRate: 10,
+        repeat: 0,
+      });
+    }
+    if (this.textures.exists("wiz_gameover")) {
+      this.anims.create({
+        key: "wiz_gameover_anim",
+        frames: this.anims.generateFrameNumbers("wiz_gameover", { start: 0, end: 2 }),
+        frameRate: 8,
+        repeat: 0,
+      });
+    }
+  }
+
   /** Register Phaser animations for each enemy type's enter/idle/attack/death states. */
   private registerEnemyAnimations(): void {
     for (const key of ENEMY_KEYS) {
@@ -655,7 +677,10 @@ export default class Game extends Phaser.Scene {
     const texKey = this.textures.exists(pngKey) ? pngKey : fallbackKey;
     const sprite = this.add.image(0, 0, texKey, 0);
     sprite.setOrigin(0.5, 0.5);
-    sprite.setScale(TUNING.WISP_SCALE);
+    // The replacement sheets use 48px cells instead of the old 24px cells.
+    sprite.setScale(
+      texKey === pngKey ? TUNING.WISP_SCALE / 2 : TUNING.WISP_SCALE,
+    );
     container.add(sprite);
 
     // Question bubble — cream rounded rect with thin dark outline + dark ink
@@ -1080,21 +1105,21 @@ export default class Game extends Phaser.Scene {
 
   /* ------------------- wizard reaction animations ------------------- */
 
-  /** Switch the wizard to the idle PNG texture (or procedural fallback). */
+  /** Switch the wizard to the looping idle animation (or procedural fallback). */
   private setWizIdleTexture(): void {
     if (!this.wiz || !this.wiz.active) return;
-    if (this.textures.exists("wiz_idle")) {
-      this.wiz.setTexture("wiz_idle");
+    if (this.anims.exists("wiz_idle_anim")) {
+      this.wiz.play("wiz_idle_anim", true);
     } else {
       this.wiz.setTexture("wiz", 0);
     }
   }
 
-  /** Switch the wizard to the cast PNG texture (or procedural fallback). */
+  /** Play the cast animation (or switch to the procedural fallback frame). */
   private setWizCastTexture(): void {
     if (!this.wiz || !this.wiz.active) return;
-    if (this.textures.exists("wiz_cast")) {
-      this.wiz.setTexture("wiz_cast");
+    if (this.anims.exists("wiz_cast_anim")) {
+      this.wiz.play("wiz_cast_anim", true);
     } else {
       this.wiz.setTexture("wiz", 2);
     }
@@ -1218,9 +1243,13 @@ export default class Game extends Phaser.Scene {
 
     this.wizAnimState = "gameover";
 
-    // Staff crystal dim (tint to ink), body slump (drop + lean), then fade
+    // Play the generated defeat animation, then slump and fade as before.
     this.wiz.setTint(0x2b241e); // inkHi — dark/dimmed
-    this.setWizIdleTexture();
+    if (this.anims.exists("wiz_gameover_anim")) {
+      this.wiz.play("wiz_gameover_anim", true);
+    } else {
+      this.setWizIdleTexture();
+    }
 
     const origY = TUNING.WIZ_BOTTOM_Y;
     this.wizReactionTween = this.tweens.add({

@@ -37,3 +37,5 @@ publishing-assets/
 .yarn/
 credential/*
 translations/sheet.csv
+.next/*
+dev.log
